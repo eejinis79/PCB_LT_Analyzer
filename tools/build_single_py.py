@@ -23,6 +23,7 @@ MODULES = [
     "screener/paths.py",
     "screener/core.py",
     "screener/vault.py",
+    "screener/db.py",
     "screener/data/demo.py",
     "screener/data/krx.py",
     "screener/data/dart.py",
@@ -32,6 +33,7 @@ MODULES = [
     "screener/gui/models.py",
     "screener/gui/workers.py",
     "screener/gui/account.py",
+    "screener/gui/db_dialog.py",
     "screener/gui/main_window.py",
     "run_screener.py",
 ]
@@ -48,6 +50,7 @@ RULES = [
     ("screener/gui/workers.py", r"\bdemo\.load_panel\(", "demo_load_panel("),
     ("screener/gui/workers.py", r"\bkrx\.load_panel\(", "krx_load_panel("),
     ("screener/gui/workers.py", r"\bkrx\.login\(", "krx_login("),
+    ("screener/gui/workers.py", r"\bkrx\.LEGACY_CACHE_DIR\b", "LEGACY_CACHE_DIR"),
     ("screener/gui/main_window.py", r"\baccount\.(unlock|AccountDialog)\(", r"\1("),
     # 실행 진입점: 모듈 맨 아래에서 main() 호출은 파일 끝에 한 번만
     ("run_screener.py", r'\nif __name__ == "__main__":\n    main\(\)\n', "\n"),
@@ -99,7 +102,7 @@ def main():
     code = build()
     compile(code, str(OUT), "exec")  # 문법 확인
     leftovers = [ln for ln in code.splitlines()
-                 if re.search(r"^\s*from \.|\bT\.[A-Z]|\b(demo|krx|account)\.\w+\(", ln)]
+                 if re.search(r"^\s*from \.|\bT\.[A-Z]|(?<![\w/.'\"])(demo|krx|account)\.(?!co\b|py\b)[A-Za-z_]", ln)]
     if leftovers:
         sys.exit("변환되지 않은 참조:\n" + "\n".join(leftovers))
     OUT.write_text(code, encoding="utf-8")

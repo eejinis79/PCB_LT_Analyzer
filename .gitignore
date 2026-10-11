@@ -8,3 +8,6 @@ build/
 dist/
 *.spec
 .venv/
+*.db
+*.db-wal
+*.db-shm

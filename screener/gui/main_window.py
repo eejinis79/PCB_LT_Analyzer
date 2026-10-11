@@ -14,10 +14,12 @@ from PySide6.QtWidgets import (
 )
 
 from ..core import FLOW_DAYS, FLOW_MODES, Panel, ScreenParams, run_screen
+from ..db import StockDB, default_db_path
 from ..vault import Credentials, Vault
 from . import account
 from . import theme as T
 from .chart import ChartWidget
+from .db_dialog import DbDialog
 from .models import COLUMNS, ResultsModel, ResultsProxy
 from .widgets import Card, ParamSlider, StatChip, hbox
 from .workers import DartWorker, LoadWorker
@@ -52,6 +54,8 @@ class MainWindow(QMainWindow):
         self._dart_workers: list[DartWorker] = []
         self._dart_client = None
         self._selected: str | None = None
+        self._panel_source = ""
+        self.db_path = self.settings.value("db_path") or str(default_db_path())
 
         self._debounce = QTimer(self, singleShot=True, interval=150)
         self._debounce.timeout.connect(self.rescreen)
@@ -123,8 +127,14 @@ class MainWindow(QMainWindow):
         acct.clicked.connect(self.edit_account)
         export = QPushButton("CSV 내보내기", objectName="Ghost")
         export.clicked.connect(self.export_csv)
+        save = QPushButton("결과 DB 저장", objectName="Ghost")
+        save.setToolTip("현재 스크리닝 결과와 조건을 DB 에 기록 (나중에 신호 이후 수익률 추적용)")
+        save.clicked.connect(self.save_results)
+        db_btn = QPushButton("DB", objectName="Ghost")
+        db_btn.setToolTip("데이터 저장 위치 · 저장된 기간 보기 / 위치 변경")
+        db_btn.clicked.connect(self.open_db_dialog)
         for w in (QLabel("소스"), self.source, QLabel("기준일"), self.date_edit,
-                  self.load_btn, acct, export):
+                  self.load_btn, acct, db_btn, save, export):
             lay.addWidget(w)
         return h
 
@@ -428,7 +438,8 @@ class MainWindow(QMainWindow):
         days = max(60, p.required_days + 5)
         end = self.date_edit.date().toPython()
         creds = self.creds or Credentials()
-        self._loader = LoadWorker(source, end, days, creds.krx_id, creds.krx_pw)
+        self._loader = LoadWorker(source, end, days, creds.krx_id, creds.krx_pw, db_path=self.db_path)
+        self._loading_source = source
         self._loader.progress.connect(self._on_progress)
         self._loader.done.connect(self._on_loaded)
         self._loader.failed.connect(self._on_failed)
@@ -444,6 +455,7 @@ class MainWindow(QMainWindow):
 
     def _on_loaded(self, panel: Panel):
         self.panel = panel
+        self._panel_source = self._loading_source
         self.load_btn.setEnabled(True)
         self.progress.setVisible(False)
         d = panel.dates
@@ -553,6 +565,31 @@ class MainWindow(QMainWindow):
     def _open_naver(self, idx):
         ticker = self.proxy.index(idx.row(), 0).data()
         QDesktopServices.openUrl(QUrl(f"https://finance.naver.com/item/main.naver?code={ticker}"))
+
+    def open_db_dialog(self):
+        dlg = DbDialog(self.db_path, self)
+        dlg.exec()
+        if dlg.path != self.db_path:
+            self.db_path = dlg.path
+            self.settings.setValue("db_path", self.db_path)
+            self.statusBar().showMessage(f"DB 위치 변경: {self.db_path} — 다음 '데이터 불러오기'부터 사용", 8000)
+
+    def save_results(self):
+        if self.panel is None or self.result.empty:
+            QMessageBox.information(self, "결과 저장", "저장할 스크리닝 결과가 없습니다.")
+            return
+        if self._panel_source == "demo":
+            QMessageBox.information(self, "결과 저장", "데모 데이터 결과는 DB 에 저장하지 않습니다.")
+            return
+        asof = self.panel.dates[-1].strftime("%Y%m%d")
+        try:
+            StockDB(self.db_path).save_results(asof, self.result, self.params().to_dict(),
+                                               source=self._panel_source)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "결과 저장", f"저장 실패: {e}")
+            return
+        self.statusBar().showMessage(
+            f"{asof} 기준 {len(self.result)}종목을 DB 에 저장했습니다 ({self.db_path})", 8000)
 
     def export_csv(self):
         if self.result.empty:

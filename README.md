@@ -19,8 +19,8 @@
 | 직접 빌드 (Windows) | `build_exe.bat` 더블클릭 → `dist\VolumeSpikeScreener.exe` |
 | 직접 빌드 (공통) | `pip install -r requirements.txt pyinstaller` 후 `python build_exe.py` |
 
-exe 하나로 동작하며 Python 설치가 필요 없습니다. 계정 금고·시세 캐시·로그는
-`%APPDATA%\VolumeSpikeScreener\` (macOS: `~/Library/Application Support/…`, Linux: `~/.local/share/…`) 에 저장됩니다.
+exe 하나로 동작하며 Python 설치가 필요 없습니다. 시세 DB(`stock_data.db`)는 exe 와 같은 폴더에,
+계정 금고·로그는 `%APPDATA%\VolumeSpikeScreener\` 에 저장됩니다.
 
 ## 파이썬으로 실행 (가장 간단)
 
@@ -70,7 +70,7 @@ python run_screener.py --demo   # 계정/네트워크 없이 합성 데이터로
 
 | 영역 | 내용 |
 |---|---|
-| 상단 | 데이터 소스(KRX/데모), 기준일, 데이터 불러오기, 계정(비밀번호 잠금), CSV 내보내기 |
+| 상단 | 데이터 소스(KRX/데모), 기준일, 데이터 불러오기, 계정(비밀번호 잠금), DB(위치·상태), 결과 DB 저장, CSV 내보내기 |
 | 왼쪽 | 조건 카드 — ① 거래량 ② 가격 ③ 유동성·규모 ④ 시장·제외 ⑤ 수급(외국인·기관), 프리셋 저장/불러오기 |
 | 가운데 | 결과 요약 칩, 종목 검색, 결과 테이블(컬럼 클릭 정렬, 더블클릭 → 네이버 금융) |
 | 아래 | 선택 종목 캔들+거래량 차트(파랑 음영=평소 구간, 주황=급증 구간), DART 공시 목록 |
@@ -101,11 +101,21 @@ python run_screener.py --demo   # 계정/네트워크 없이 합성 데이터로
 
 점수 = `log2(거래량배수) × 10 / (1 + |기간등락률| + 0.5 × 일중변동폭)` — 거래량이 클수록, 가격이 덜 움직일수록 높음.
 
-## 데이터 수집 방식
+## 데이터 저장 (DB)
 
-날짜별 '전종목 시세'를 시장별로 한 번씩 받아(약 60영업일 × 2시장 ≈ 120회 호출) 패널로 합치고,
-최근 10영업일의 외국인·기관합계 순매수(10일 × 2시장 × 2투자자 = 40회)를 함께 받습니다.
-지난 영업일 데이터는 사용자 폴더의 `cache/` 에 저장되어 두 번째 실행부터는 거의 즉시 로드됩니다.
+받아온 데이터는 **SQLite DB 파일 하나**(`stock_data.db`)에 쌓입니다.
+
+| 항목 | 내용 |
+|---|---|
+| 기본 위치 | 프로그램 폴더 (`run_screener.py` 가 있는 폴더, exe 는 exe 가 있는 폴더) |
+| 위치 변경 | 상단 **DB** 버튼 → 위치 변경 (기존 .db 파일을 고르면 그 DB 사용) |
+| 저장 내용 | 일별 전종목 시세, 외국인·기관 순매수, 시가총액, 종목명, **저장한 스크리닝 결과** |
+| 다시 받는 것 | 아직 DB 에 없는 날짜만. 오늘 데이터는 18시 이전엔 장중 값이므로 매번 새로 받고, 18시 이후 확정 저장 |
+| 결과 저장 | 상단 **결과 DB 저장** → 기준일 · 조건 · 종목별 지표 기록 (같은 기준일·조건은 덮어씀) |
+| 열어보기 | [DB Browser for SQLite](https://sqlitebrowser.org/) 또는 `pandas.read_sql` |
+
+처음 실행은 약 60영업일 × 2시장 ≈ 120회 + 순매수 40회를 받느라 수 분 걸리고,
+다음부터는 새 날짜분(하루 약 6~10회)만 받습니다. 예전 버전의 `.pkl` 캐시가 있으면 처음 실행 때 DB 로 옮깁니다.
 순매수 수집이 실패해도 시세 스크리닝은 그대로 동작하며, 수급 조건 카드에 경고가 표시됩니다.
 조건 슬라이더 조정은 네트워크 호출 없이 메모리에서만 다시 계산합니다.
 
@@ -123,7 +133,8 @@ volume_spike_screener.py   # 단일 파일 배포본 (tools/build_single_py.py �
 build_exe.py / build_exe.bat   # PyInstaller 실행파일 빌드
 screener/core.py           # 스크리닝 로직 (pandas, GUI 독립) — 거래량/가격/수급 조건
 screener/vault.py          # 계정 정보 암호화 금고 (초기 비밀번호 0000)
-screener/paths.py          # 사용자 데이터 폴더
+screener/db.py             # SQLite DB (시세·수급·스크리닝 결과 저장)
+screener/paths.py          # 사용자 데이터 폴더 (계정 금고·로그)
 screener/data/krx.py       # KRX 로그인 + 시세 패널 수집/캐시
 screener/data/dart.py      # OpenDART 공시 조회·분류
 screener/data/demo.py      # 오프라인 합성 데이터

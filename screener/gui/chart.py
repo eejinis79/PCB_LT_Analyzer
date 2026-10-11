@@ -6,7 +6,10 @@ from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("QtAgg")
+try:
+    matplotlib.use("QtAgg")
+except ImportError:  # pyplot 이 다른 백엔드로 먼저 로드된 경우 — Qt 캔버스를 직접 쓰므로 무관
+    pass
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib import font_manager as fm  # noqa: E402

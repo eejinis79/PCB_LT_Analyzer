@@ -422,6 +422,259 @@ class Vault:
 
 
 # ============================================================================
+# screener/db.py
+# ============================================================================
+"""시세·수급·스크리닝 결과를 저장하는 SQLite DB.
+
+파일 하나(기본: 프로그램 폴더의 stock_data.db)에 모두 쌓는다. 서버 설치가 필요 없고,
+DB Browser for SQLite 같은 도구나 pandas 로 직접 열어볼 수 있다.
+
+테이블
+  fetch_log    (date, market, kind)        — 받아온 날짜 기록 (휴장일 포함, 재조회 방지)
+  ohlcv        (date, ticker)              — 일별 전종목 시세
+  flows        (date, ticker, investor)    — 일별 투자자별 순매수거래대금(원)
+  market_cap   (date, ticker)              — 시가총액 · 상장주식수
+  tickers      (ticker)                    — 종목명 · 시장
+  screen_runs / screen_results             — 저장한 스크리닝 결과 (조건 + 종목별 지표)
+"""
+
+import datetime as dt
+import json
+import os
+import sqlite3
+import sys
+from contextlib import closing, contextmanager
+from pathlib import Path
+
+import pandas as pd
+
+DB_FILENAME = "stock_data.db"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS fetch_log (
+    date TEXT NOT NULL, market TEXT NOT NULL, kind TEXT NOT NULL,
+    holiday INTEGER NOT NULL DEFAULT 0, fetched_at TEXT NOT NULL,
+    PRIMARY KEY (date, market, kind)
+);
+CREATE TABLE IF NOT EXISTS ohlcv (
+    date TEXT NOT NULL, ticker TEXT NOT NULL, market TEXT NOT NULL,
+    open REAL, high REAL, low REAL, close REAL, volume REAL, value REAL,
+    PRIMARY KEY (date, ticker)
+);
+CREATE TABLE IF NOT EXISTS flows (
+    date TEXT NOT NULL, ticker TEXT NOT NULL, investor TEXT NOT NULL, net_value REAL,
+    PRIMARY KEY (date, ticker, investor)
+);
+CREATE TABLE IF NOT EXISTS market_cap (
+    date TEXT NOT NULL, ticker TEXT NOT NULL, market_cap REAL, shares REAL,
+    PRIMARY KEY (date, ticker)
+);
+CREATE TABLE IF NOT EXISTS tickers (
+    ticker TEXT PRIMARY KEY, name TEXT, market TEXT, updated TEXT
+);
+CREATE TABLE IF NOT EXISTS screen_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof TEXT NOT NULL, saved_at TEXT NOT NULL, source TEXT, params TEXT, n_hits INTEGER
+);
+CREATE TABLE IF NOT EXISTS screen_results (
+    run_id INTEGER NOT NULL REFERENCES screen_runs(run_id) ON DELETE CASCADE,
+    rank INTEGER, ticker TEXT NOT NULL, name TEXT, market TEXT, close REAL,
+    chg_pct REAL, vol_ratio REAL, value_eok REAL, frg_eok REAL, inst_eok REAL, score REAL,
+    metrics TEXT,
+    PRIMARY KEY (run_id, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_screen_results_ticker ON screen_results(ticker);
+"""
+
+OHLCV_FIELDS = ["open", "high", "low", "close", "volume", "value"]
+
+
+def program_dir() -> Path:
+    """프로그램 폴더: exe 로 실행하면 exe 가 있는 폴더, 소스로 실행하면 run_screener.py 가 있는 폴더."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    here = Path(__file__).resolve().parent
+    for d in (here.parent, here):  # 패키지(screener/db.py) 또는 단일 파일 배포본
+        if (d / "run_screener.py").exists():
+            return d
+    return here
+
+
+def default_db_path() -> Path:
+    if os.environ.get("VSS_HOME"):  # 테스트용
+        return Path(os.environ["VSS_HOME"]) / DB_FILENAME
+    return program_dir() / DB_FILENAME
+
+
+class StockDB:
+    """스레드마다 연결을 새로 여는 얇은 래퍼 (sqlite3 연결은 스레드 간 공유 불가)."""
+
+    def __init__(self, path: str | Path | None = None):
+        self.path = Path(path) if path else default_db_path()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._conn() as c:
+            c.executescript(SCHEMA)
+
+    @contextmanager
+    def _conn(self):
+        with closing(sqlite3.connect(self.path, timeout=30)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            with conn:  # 커밋/롤백
+                yield conn
+
+    # ------------------------------------------------------------ 수집 기록
+    def fetched(self, date: str, market: str, kind: str) -> bool:
+        """이미 받아 둔 날짜인지 (휴장일로 기록된 날 포함)."""
+        with self._conn() as c:
+            row = c.execute("SELECT 1 FROM fetch_log WHERE date=? AND market=? AND kind=?",
+                            (date, market, kind)).fetchone()
+        return row is not None
+
+    def is_holiday(self, date: str, market: str) -> bool:
+        with self._conn() as c:
+            row = c.execute("SELECT holiday FROM fetch_log WHERE date=? AND market=? AND kind='ohlcv'",
+                            (date, market)).fetchone()
+        return bool(row and row[0])
+
+    def _log(self, c, date, market, kind, holiday=False):
+        c.execute("INSERT OR REPLACE INTO fetch_log VALUES (?,?,?,?,?)",
+                  (date, market, kind, int(holiday), dt.datetime.now().isoformat(timespec="seconds")))
+
+    # ------------------------------------------------------------ 시세
+    def save_ohlcv(self, date: str, market: str, df: pd.DataFrame, holiday: bool = False,
+                   final: bool = True):
+        """df: index=종목코드, columns=OHLCV_FIELDS.
+        final=False(장중 데이터)면 값은 저장하되 '받음' 기록은 남기지 않아 다음에 다시 받는다."""
+        rows = [] if holiday else [
+            (date, t, market, *[None if pd.isna(v) else float(v) for v in r])
+            for t, r in zip(df.index, df[OHLCV_FIELDS].itertuples(index=False))]
+        with self._conn() as c:
+            c.execute("DELETE FROM ohlcv WHERE date=? AND market=?", (date, market))
+            c.executemany("INSERT OR REPLACE INTO ohlcv VALUES (?,?,?,?,?,?,?,?,?)", rows)
+            if final:
+                self._log(c, date, market, "ohlcv", holiday)
+
+    def load_ohlcv(self, dates: list[str], markets) -> pd.DataFrame:
+        """long 형태 (date, ticker, market, open..value)."""
+        if not dates:
+            return pd.DataFrame(columns=["date", "ticker", "market", *OHLCV_FIELDS])
+        q = (f"SELECT * FROM ohlcv WHERE date IN ({','.join('?' * len(dates))}) "
+             f"AND market IN ({','.join('?' * len(markets))})")
+        with self._conn() as c:
+            return pd.read_sql_query(q, c, params=[*dates, *markets])
+
+    # ------------------------------------------------------------ 수급
+    def save_flow(self, date: str, market: str, investor: str, s: pd.Series, final: bool = True):
+        rows = [(date, t, investor, float(v)) for t, v in s.items() if pd.notna(v)]
+        with self._conn() as c:
+            c.executemany("INSERT OR REPLACE INTO flows VALUES (?,?,?,?)", rows)
+            if final and rows:  # 빈 응답은 기록하지 않아 다음에 다시 시도
+                self._log(c, date, market, f"flow_{investor}")
+
+    def load_flows(self, dates: list[str], investor: str) -> pd.DataFrame:
+        """날짜 x 종목 순매수거래대금."""
+        if not dates:
+            return pd.DataFrame()
+        q = (f"SELECT date, ticker, net_value FROM flows WHERE investor=? "
+             f"AND date IN ({','.join('?' * len(dates))})")
+        with self._conn() as c:
+            df = pd.read_sql_query(q, c, params=[investor, *dates])
+        if df.empty:
+            return pd.DataFrame()
+        wide = df.pivot(index="date", columns="ticker", values="net_value")
+        wide.index = pd.to_datetime(wide.index)
+        return wide.sort_index()
+
+    # ------------------------------------------------------------ 시가총액 · 종목명
+    def save_caps(self, date: str, df: pd.DataFrame):
+        rows = [(date, t, float(r.market_cap), float(r.shares)) for t, r in df.iterrows()]
+        with self._conn() as c:
+            c.executemany("INSERT OR REPLACE INTO market_cap VALUES (?,?,?,?)", rows)
+
+    def load_caps(self, date: str) -> pd.DataFrame:
+        with self._conn() as c:
+            df = pd.read_sql_query("SELECT ticker, market_cap, shares FROM market_cap WHERE date=?",
+                                   c, params=[date])
+        return df.set_index("ticker")
+
+    def save_names(self, names: dict[str, str], markets: dict[str, str]):
+        now = dt.date.today().isoformat()
+        rows = [(t, n, markets.get(t), now) for t, n in names.items() if n]
+        with self._conn() as c:
+            c.executemany("INSERT OR REPLACE INTO tickers VALUES (?,?,?,?)", rows)
+
+    def load_names(self) -> dict[str, str]:
+        with self._conn() as c:
+            return dict(c.execute("SELECT ticker, name FROM tickers").fetchall())
+
+    # ------------------------------------------------------------ 스크리닝 결과
+    def save_results(self, asof: str, result: pd.DataFrame, params: dict, source: str = "krx") -> int:
+        """스크리닝 결과 저장. 같은 기준일·같은 조건으로 다시 저장하면 덮어쓴다. run_id 반환."""
+        pj = json.dumps(params, ensure_ascii=False, sort_keys=True)
+        main_cols = ["close", "chg_pct", "vol_ratio", "value_eok", "frg_eok", "inst_eok", "score"]
+
+        def num(v):
+            return None if pd.isna(v) else float(v)
+
+        with self._conn() as c:
+            c.execute("DELETE FROM screen_runs WHERE asof=? AND params=? AND source=?", (asof, pj, source))
+            cur = c.execute(
+                "INSERT INTO screen_runs (asof, saved_at, source, params, n_hits) VALUES (?,?,?,?,?)",
+                (asof, dt.datetime.now().isoformat(timespec="seconds"), source, pj, len(result)))
+            run_id = cur.lastrowid
+            rows = []
+            for rank, r in enumerate(result.to_dict("records"), 1):
+                extra = {k: num(v) for k, v in r.items()
+                         if k not in main_cols and k not in ("ticker", "name", "market")}
+                rows.append((run_id, rank, r["ticker"], r.get("name"), r.get("market"),
+                             *[num(r.get(k)) for k in main_cols], json.dumps(extra)))
+            c.executemany("INSERT INTO screen_results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        return run_id
+
+    def load_results(self, asof: str | None = None) -> pd.DataFrame:
+        q = ("SELECT r.asof, r.saved_at, s.* FROM screen_results s JOIN screen_runs r USING(run_id)"
+             + (" WHERE r.asof=?" if asof else "") + " ORDER BY r.asof DESC, s.run_id DESC, s.rank")
+        with self._conn() as c:
+            return pd.read_sql_query(q, c, params=[asof] if asof else [])
+
+    # ------------------------------------------------------------ 상태
+    def stats(self) -> dict:
+        with self._conn() as c:
+            d0, d1, nd = c.execute(
+                "SELECT MIN(date), MAX(date), COUNT(DISTINCT date) FROM ohlcv").fetchone()
+            n_ohlcv = c.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0]
+            n_flow_days = c.execute("SELECT COUNT(DISTINCT date) FROM flows").fetchone()[0]
+            n_runs = c.execute("SELECT COUNT(*) FROM screen_runs").fetchone()[0]
+        size = sum(p.stat().st_size for p in self.path.parent.glob(self.path.name + "*") if p.exists())
+        return {"path": str(self.path), "size_mb": size / 1e6, "first": d0, "last": d1,
+                "days": nd or 0, "ohlcv_rows": n_ohlcv, "flow_days": n_flow_days, "runs": n_runs}
+
+    # ------------------------------------------------------------ 이전 캐시(pkl) 이전
+    def import_pickle_cache(self, cache_dir: Path) -> int:
+        """예전 버전이 저장한 .pkl 캐시를 DB 로 옮긴다. 옮긴 파일 수 반환 (원본은 그대로 둠)."""
+        if not cache_dir.exists():
+            return 0
+        n = 0
+        for p in sorted(cache_dir.glob("*.pkl")):
+            parts = p.stem.split("_")
+            try:
+                if parts[0] == "flow" and len(parts) == 4:
+                    _, date, market, inv = parts
+                    if not self.fetched(date, market, f"flow_{inv}"):
+                        self.save_flow(date, market, inv, pd.read_pickle(p))
+                        n += 1
+                elif len(parts) == 2 and parts[0].isdigit():
+                    date, market = parts
+                    if not self.fetched(date, market, "ohlcv"):
+                        self.save_ohlcv(date, market, pd.read_pickle(p))
+                        n += 1
+            except Exception as e:  # noqa: BLE001 — 깨진 캐시 파일은 건너뜀
+                print(f"캐시 이전 실패 {p.name}: {e}")
+        return n
+
+
+# ============================================================================
 # screener/data/demo.py
 # ============================================================================
 """오프라인 데모/테스트용 합성 시세. 일부 종목에 '거래량 급증 + 가격 횡보' 패턴을 심어 둔다."""
@@ -500,19 +753,21 @@ def demo_load_panel(end: dt.date | None = None, days: int = 60, n_tickers: int =
 
 2025년 이후 KRX 정보데이터시스템은 로그인 세션이 필요하므로 KRX 계정으로 로그인한 뒤
 날짜별 '전종목 시세'를 받아 Panel 로 합친다. (종목별 조회보다 호출 수가 훨씬 적다)
-지난 영업일 데이터는 .cache/ 에 저장해 재실행 시 다시 받지 않는다.
+받은 데이터는 SQLite DB(screener/db.py, 기본: 프로그램 폴더의 stock_data.db)에 쌓아
+재실행 시 새 날짜만 받는다.
 """
 
 import datetime as dt
 import os
 import time
-from pathlib import Path
 from typing import Callable
 
 import pandas as pd
 
 
-CACHE_DIR = cache_dir("krx")
+# 예전 버전의 .pkl 캐시 위치 (DB 로 이전할 때만 사용)
+LEGACY_CACHE_DIR = cache_dir("krx")
+FINAL_HOUR = 18  # 이 시각 이후의 당일 데이터는 확정으로 보고 DB 에 고정
 # pykrx 투자자 구분 이름
 INVESTOR_NAMES = {"foreign": "외국인", "inst": "기관합계"}
 OHLCV_COLS = {"시가": "open", "고가": "high", "저가": "low", "종가": "close",
@@ -555,109 +810,116 @@ def _business_days(end: dt.date, count: int) -> list[str]:
     return days[-count:]
 
 
-def _fetch_day(date: str, market: str, use_cache: bool) -> tuple[pd.DataFrame, bool]:
-    """(시세, 휴장일 여부)"""
+def is_final(date: str, now: dt.datetime | None = None) -> bool:
+    """DB 에 확정 저장해도 되는 날짜인지. 오늘 데이터는 장 마감 후(18시 이후)에만 확정으로 본다."""
+    now = now or dt.datetime.now()
+    today = now.strftime("%Y%m%d")
+    return date < today or (date == today and now.hour >= FINAL_HOUR)
+
+
+def _fetch_day(db: StockDB, date: str, market: str) -> bool:
+    """DB 에 없으면 KRX 에서 받아 저장. 네트워크를 썼으면 True."""
+    if db.fetched(date, market, "ohlcv"):  # 확정 데이터만 기록되므로 그대로 사용
+        return False
     from pykrx import stock
 
-    path = CACHE_DIR / f"{date}_{market}.pkl"
-    if use_cache and path.exists():
-        return pd.read_pickle(path), False
     df = stock.get_market_ohlcv_by_ticker(date, market=market)
     if df is None or df.empty:
         raise KrxError(f"{date} {market} 시세가 비어 있습니다. (로그인 세션/휴장일 확인)")
     df = df.rename(columns=OHLCV_COLS)[list(OHLCV_COLS.values())]
-    is_holiday = (df[["open", "high", "low", "close"]] == 0).all(axis=None)
-    if use_cache and not is_holiday:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_pickle(path)
-    return df, is_holiday
+    holiday = bool((df[["open", "high", "low", "close"]] == 0).all(axis=None))
+    db.save_ohlcv(date, market, df, holiday=holiday, final=is_final(date))
+    return True
 
 
 def krx_load_panel(end: dt.date, days: int, markets=("KOSPI", "KOSDAQ"),
-               progress: Progress | None = None, sleep: float = 0.2) -> Panel:
-    """기준일 end 까지 days 영업일의 KOSPI/KOSDAQ 전종목 패널을 만든다."""
+               progress: Progress | None = None, sleep: float = 0.2,
+               db: StockDB | None = None) -> Panel:
+    """기준일 end 까지 days 영업일의 KOSPI/KOSDAQ 전종목 패널을 만든다.
+
+    이미 DB 에 있는 날짜는 KRX 에 다시 묻지 않는다. (처음 한 번만 오래 걸림)
+    """
     from pykrx import stock
 
+    db = db or StockDB()
     progress = progress or (lambda *_: None)
-    today = dt.date.today()
+    progress(0, 1, f"DB 확인 중… ({db.path})")
     dates = _business_days(end, days)
     flow_dates = dates[-FLOW_DAYS:]
     total = len(dates) * len(markets) + len(markets) + len(flow_dates) * len(markets) * len(INVESTOR_NAMES)
-    frames: dict[str, list[pd.DataFrame]] = {}
-    market_of: dict[str, str] = {}
-    step = 0
+    step, fetched = 0, 0
     for date in dates:
+        for market in markets:
+            step += 1
+            progress(step, total, f"{date} {market} 시세")
+            if _fetch_day(db, date, market):
+                fetched += 1
+                time.sleep(sleep)
+
+    long = db.load_ohlcv(dates, markets)
+    if long.empty:
+        raise KrxError("수집된 시세가 없습니다.")
+    long["date"] = pd.to_datetime(long["date"])
+    wide = {f: long.pivot(index="date", columns="ticker", values=f).sort_index()
+            for f in OHLCV_COLS.values()}
+    market_of = long.drop_duplicates("ticker", keep="last").set_index("ticker")["market"]
+    trade_dates = [d.strftime("%Y%m%d") for d in wide["close"].index]
+
+    last = trade_dates[-1]
+    cap = db.load_caps(last)
+    if cap.empty or not is_final(last):
         parts = []
         for market in markets:
             step += 1
-            progress(step, total, f"{date} {market} 시세 수집")
-            # 당일 데이터는 장중에 바뀌므로 캐시하지 않는다
-            df, holiday = _fetch_day(date, market, use_cache=date != today.strftime("%Y%m%d"))
-            if holiday:
-                continue
-            for t in df.index:
-                market_of[t] = market
-            parts.append(df)
-            time.sleep(sleep)
-        if parts:
-            frames[date] = parts
-
-    if not frames:
-        raise KrxError("수집된 시세가 없습니다.")
-    long = pd.concat(
-        {pd.Timestamp(d): pd.concat(p) for d, p in frames.items()}, names=["date", "ticker"])
-    wide = {f: long[f].unstack("ticker").sort_index() for f in OHLCV_COLS.values()}
-
-    last = max(frames)
-    caps = []
-    for market in markets:
-        step += 1
-        progress(step, total, f"{market} 시가총액 수집")
-        caps.append(stock.get_market_cap_by_ticker(last, market=market))
-    cap = pd.concat(caps)
+            progress(step, total, f"{market} 시가총액")
+            parts.append(stock.get_market_cap_by_ticker(last, market=market))
+        raw = pd.concat(parts)
+        cap = pd.DataFrame({"market_cap": raw["시가총액"], "shares": raw["상장주식수"]})
+        db.save_caps(last, cap)
     meta = pd.DataFrame(index=wide["close"].columns)
-    meta["market"] = pd.Series(market_of)
-    meta["market_cap"] = cap["시가총액"].reindex(meta.index)
-    meta["shares"] = cap["상장주식수"].reindex(meta.index)
-    flows, step = _load_flows(stock, [d for d in flow_dates if d in frames], markets,
+    meta["market"] = market_of
+    meta["market_cap"] = cap["market_cap"].reindex(meta.index)
+    meta["shares"] = cap["shares"].reindex(meta.index)
+
+    flows, step = _load_flows(db, [d for d in flow_dates if d in trade_dates], markets,
                               progress, step, total, sleep)
-    progress(total, total, "종목명 매핑")
-    meta["name"] = [_safe_name(stock, t) for t in meta.index]
+
+    names = db.load_names()
+    missing = [t for t in meta.index if t not in names]
+    if missing:
+        progress(total, total, f"종목명 {len(missing)}개 조회")
+        new = {t: _safe_name(stock, t) for t in missing}
+        db.save_names(new, market_of.to_dict())
+        names.update(new)
+    meta["name"] = [names.get(t, "") for t in meta.index]
+    progress(total, total, f"완료 — KRX 신규 조회 {fetched}일분, 나머지는 DB 사용")
     # 상장 전/거래정지 등 결측은 NaN 으로 둔다 (0 으로 채우면 평소 거래량이 왜곡됨)
     return Panel(**wide, meta=meta, flows=flows)
 
 
-def _fetch_flow_day(stock, date: str, market: str, investor: str, use_cache: bool) -> pd.Series:
-    path = CACHE_DIR / f"flow_{date}_{market}_{investor}.pkl"
-    if use_cache and path.exists():
-        return pd.read_pickle(path)
-    df = stock.get_market_net_purchases_of_equities_by_ticker(
-        date, date, market=market, investor=INVESTOR_NAMES[investor])
-    s = df["순매수거래대금"].astype(float) if df is not None and not df.empty else pd.Series(dtype=float)
-    if use_cache and not s.empty:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        s.to_pickle(path)
-    return s
-
-
-def _load_flows(stock, dates, markets, progress, step, total, sleep):
+def _load_flows(db: StockDB, dates, markets, progress, step, total, sleep):
     """최근 영업일별 외국인/기관 순매수거래대금. 실패해도 시세 로딩은 계속한다(빈 dict)."""
-    today = dt.date.today().strftime("%Y%m%d")
-    out = {}
+    from pykrx import stock
+
     try:
-        for inv in INVESTOR_NAMES:
-            rows = {}
+        for inv, inv_name in INVESTOR_NAMES.items():
             for date in dates:
-                parts = []
                 for market in markets:
                     step += 1
-                    progress(step, total, f"{date} {market} {INVESTOR_NAMES[inv]} 순매수 수집")
-                    parts.append(_fetch_flow_day(stock, date, market, inv, use_cache=date != today))
+                    progress(step, total, f"{date} {market} {inv_name} 순매수")
+                    if db.fetched(date, market, f"flow_{inv}"):
+                        continue
+                    df = stock.get_market_net_purchases_of_equities_by_ticker(
+                        date, date, market=market, investor=inv_name)
+                    s = (df["순매수거래대금"].astype(float) if df is not None and not df.empty
+                         else pd.Series(dtype=float))
+                    db.save_flow(date, market, inv, s, final=is_final(date))
                     time.sleep(sleep)
-                rows[pd.Timestamp(date)] = pd.concat(parts)
-            out[inv] = pd.DataFrame(rows).T.sort_index().fillna(0)
     except Exception as e:  # noqa: BLE001
         print(f"투자자별 순매수 수집 실패 (수급 조건 사용 불가): {e}")
+        return {}, step
+    out = {inv: db.load_flows(dates, inv).fillna(0) for inv in INVESTOR_NAMES}
+    if any(df.empty for df in out.values()):
         return {}, step
     return out, step
 
@@ -1047,7 +1309,10 @@ from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("QtAgg")
+try:
+    matplotlib.use("QtAgg")
+except ImportError:  # pyplot 이 다른 백엔드로 먼저 로드된 경우 — Qt 캔버스를 직접 쓰므로 무관
+    pass
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib import font_manager as fm  # noqa: E402
@@ -1261,19 +1526,27 @@ class LoadWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, source: str, end: dt.date, days: int, krx_id: str = "", krx_pw: str = ""):
+    def __init__(self, source: str, end: dt.date, days: int, krx_id: str = "", krx_pw: str = "",
+                 db_path: str | None = None):
         super().__init__()
         self.source, self.end, self.days = source, end, days
         self.krx_id, self.krx_pw = krx_id, krx_pw
+        self.db_path = db_path
 
     def run(self):
         try:
             if self.source == "demo":
                 panel = demo_load_panel(self.end, self.days, progress=self.progress.emit)
             else:
+                db = StockDB(self.db_path)
+                if db.stats()["days"] == 0:  # 예전 버전 캐시(.pkl)가 있으면 DB 로 옮겨 재다운로드 방지
+                    self.progress.emit(0, 1, "이전 캐시를 DB 로 옮기는 중…")
+                    n = db.import_pickle_cache(LEGACY_CACHE_DIR)
+                    if n:
+                        print(f"이전 캐시 {n}개 파일을 DB 로 옮김")
                 self.progress.emit(0, 1, "KRX 로그인 중…")
                 krx_login(self.krx_id, self.krx_pw)
-                panel = krx_load_panel(self.end, self.days, progress=self.progress.emit)
+                panel = krx_load_panel(self.end, self.days, progress=self.progress.emit, db=db)
             self.done.emit(panel)
         except Exception as e:  # noqa: BLE001 — 사용자에게 그대로 보여준다
             traceback.print_exc()
@@ -1564,6 +1837,100 @@ class AccountDialog(_Base):
 
 
 # ============================================================================
+# screener/gui/db_dialog.py
+# ============================================================================
+"""DB 위치·상태 화면."""
+
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (
+    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QVBoxLayout,
+)
+
+
+
+class DbDialog(QDialog):
+    """현재 DB 경로와 저장된 데이터 범위를 보여주고, 위치를 바꿀 수 있게 한다."""
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("데이터 저장소 (DB)")
+        self.setMinimumWidth(560)
+        self.path = path
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 20)
+        card = Card("SQLite DB", "받아온 시세 · 외국인/기관 순매수 · 저장한 스크리닝 결과가 이 파일 하나에 쌓입니다. "
+                                 "이미 받은 날짜는 다시 받지 않습니다.")
+        self.form = QFormLayout()
+        self.form.setSpacing(8)
+        self.lbl_path = QLabel(wordWrap=True)
+        self.lbl_path.setTextInteractionFlags(self.lbl_path.textInteractionFlags() |
+                                              self.lbl_path.textInteractionFlags().TextSelectableByMouse)
+        self.lbl_range = QLabel()
+        self.lbl_rows = QLabel()
+        self.lbl_runs = QLabel()
+        self.lbl_size = QLabel()
+        for k, w in (("위치", self.lbl_path), ("시세 기간", self.lbl_range), ("데이터", self.lbl_rows),
+                     ("저장한 결과", self.lbl_runs), ("파일 크기", self.lbl_size)):
+            self.form.addRow(k, w)
+        card.body.addLayout(self.form)
+        lay.addWidget(card)
+
+        row = QHBoxLayout()
+        change = QPushButton("위치 변경…")
+        change.clicked.connect(self._change)
+        reset = QPushButton("기본 위치로", objectName="Ghost")
+        reset.clicked.connect(lambda: self._set(str(default_db_path())))
+        opendir = QPushButton("폴더 열기", objectName="Ghost")
+        opendir.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self.path).parent))))
+        bb = QDialogButtonBox(QDialogButtonBox.Ok)
+        bb.button(QDialogButtonBox.Ok).setText("닫기")
+        bb.accepted.connect(self.accept)
+        for w in (change, reset, opendir):
+            row.addWidget(w)
+        row.addStretch(1)
+        row.addWidget(bb)
+        lay.addLayout(row)
+        self._refresh()
+
+    def _refresh(self):
+        try:
+            st = StockDB(self.path).stats()
+        except Exception as e:  # noqa: BLE001
+            self.lbl_path.setText(f"{self.path}\n⚠ 열 수 없음: {e}")
+            return
+        fmt = lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}" if d else "–"  # noqa: E731
+        self.lbl_path.setText(st["path"])
+        self.lbl_range.setText(f"{fmt(st['first'])} ~ {fmt(st['last'])}  ({st['days']}영업일)")
+        self.lbl_rows.setText(f"시세 {st['ohlcv_rows']:,}행 · 수급 {st['flow_days']}영업일")
+        self.lbl_runs.setText(f"{st['runs']}회")
+        self.lbl_size.setText(f"{st['size_mb']:.1f} MB")
+
+    def _set(self, path: str):
+        self.path = path
+        self._refresh()
+
+    def _change(self):
+        start = str(Path(self.path).parent / DB_FILENAME)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "DB 파일 위치 (기존 파일을 고르면 그 DB 를 사용)", start, "SQLite DB (*.db)",
+            options=QFileDialog.DontConfirmOverwrite)
+        if not path:
+            return
+        if not path.lower().endswith(".db"):
+            path += ".db"
+        try:
+            StockDB(path)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "DB", f"이 위치에 DB 를 만들 수 없습니다:\n{e}")
+            return
+        self._set(path)
+
+
+# ============================================================================
 # screener/gui/main_window.py
 # ============================================================================
 import datetime as dt
@@ -1610,6 +1977,8 @@ class MainWindow(QMainWindow):
         self._dart_workers: list[DartWorker] = []
         self._dart_client = None
         self._selected: str | None = None
+        self._panel_source = ""
+        self.db_path = self.settings.value("db_path") or str(default_db_path())
 
         self._debounce = QTimer(self, singleShot=True, interval=150)
         self._debounce.timeout.connect(self.rescreen)
@@ -1681,8 +2050,14 @@ class MainWindow(QMainWindow):
         acct.clicked.connect(self.edit_account)
         export = QPushButton("CSV 내보내기", objectName="Ghost")
         export.clicked.connect(self.export_csv)
+        save = QPushButton("결과 DB 저장", objectName="Ghost")
+        save.setToolTip("현재 스크리닝 결과와 조건을 DB 에 기록 (나중에 신호 이후 수익률 추적용)")
+        save.clicked.connect(self.save_results)
+        db_btn = QPushButton("DB", objectName="Ghost")
+        db_btn.setToolTip("데이터 저장 위치 · 저장된 기간 보기 / 위치 변경")
+        db_btn.clicked.connect(self.open_db_dialog)
         for w in (QLabel("소스"), self.source, QLabel("기준일"), self.date_edit,
-                  self.load_btn, acct, export):
+                  self.load_btn, acct, db_btn, save, export):
             lay.addWidget(w)
         return h
 
@@ -1986,7 +2361,8 @@ class MainWindow(QMainWindow):
         days = max(60, p.required_days + 5)
         end = self.date_edit.date().toPython()
         creds = self.creds or Credentials()
-        self._loader = LoadWorker(source, end, days, creds.krx_id, creds.krx_pw)
+        self._loader = LoadWorker(source, end, days, creds.krx_id, creds.krx_pw, db_path=self.db_path)
+        self._loading_source = source
         self._loader.progress.connect(self._on_progress)
         self._loader.done.connect(self._on_loaded)
         self._loader.failed.connect(self._on_failed)
@@ -2002,6 +2378,7 @@ class MainWindow(QMainWindow):
 
     def _on_loaded(self, panel: Panel):
         self.panel = panel
+        self._panel_source = self._loading_source
         self.load_btn.setEnabled(True)
         self.progress.setVisible(False)
         d = panel.dates
@@ -2110,6 +2487,31 @@ class MainWindow(QMainWindow):
     def _open_naver(self, idx):
         ticker = self.proxy.index(idx.row(), 0).data()
         QDesktopServices.openUrl(QUrl(f"https://finance.naver.com/item/main.naver?code={ticker}"))
+
+    def open_db_dialog(self):
+        dlg = DbDialog(self.db_path, self)
+        dlg.exec()
+        if dlg.path != self.db_path:
+            self.db_path = dlg.path
+            self.settings.setValue("db_path", self.db_path)
+            self.statusBar().showMessage(f"DB 위치 변경: {self.db_path} — 다음 '데이터 불러오기'부터 사용", 8000)
+
+    def save_results(self):
+        if self.panel is None or self.result.empty:
+            QMessageBox.information(self, "결과 저장", "저장할 스크리닝 결과가 없습니다.")
+            return
+        if self._panel_source == "demo":
+            QMessageBox.information(self, "결과 저장", "데모 데이터 결과는 DB 에 저장하지 않습니다.")
+            return
+        asof = self.panel.dates[-1].strftime("%Y%m%d")
+        try:
+            StockDB(self.db_path).save_results(asof, self.result, self.params().to_dict(),
+                                               source=self._panel_source)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "결과 저장", f"저장 실패: {e}")
+            return
+        self.statusBar().showMessage(
+            f"{asof} 기준 {len(self.result)}종목을 DB 에 저장했습니다 ({self.db_path})", 8000)
 
     def export_csv(self):
         if self.result.empty:
