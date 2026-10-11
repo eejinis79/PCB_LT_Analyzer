@@ -22,7 +22,16 @@
 exe 하나로 동작하며 Python 설치가 필요 없습니다. 계정 금고·시세 캐시·로그는
 `%APPDATA%\VolumeSpikeScreener\` (macOS: `~/Library/Application Support/…`, Linux: `~/.local/share/…`) 에 저장됩니다.
 
-## 소스로 실행
+## 파이썬으로 실행 (가장 간단)
+
+1. [Python 3.10 이상](https://www.python.org/downloads/) 설치 — Windows 는 설치 첫 화면에서 **Add python.exe to PATH** 체크
+2. 이 폴더(또는 zip 압축 해제한 폴더)에서
+   - Windows: **`run_windows.bat` 더블클릭**
+   - Mac/Linux: 터미널에서 `./run_mac_linux.sh`
+3. 처음 한 번은 필요한 패키지를 자동 설치합니다(수 분). 이후에는 바로 실행됩니다.
+4. 데이터 없이 화면만 보려면 `run_windows.bat --demo` / `./run_mac_linux.sh --demo`
+
+### 직접 명령으로 실행
 
 ```bash
 pip install -r requirements.txt
