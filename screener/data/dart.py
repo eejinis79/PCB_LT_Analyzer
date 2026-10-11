@@ -9,13 +9,14 @@ import datetime as dt
 import io
 import xml.etree.ElementTree as ET
 import zipfile
-from pathlib import Path
 
 import pandas as pd
 import requests
 
+from ..paths import cache_dir
+
 BASE = "https://opendart.fss.or.kr/api"
-CACHE = Path(__file__).resolve().parents[2] / ".cache" / "dart_corp_codes.pkl"
+CACHE = cache_dir("dart_corp_codes.pkl")
 
 # 스크리닝 후보에서 주의해서 봐야 할 공시 키워드 (희석·재무위험·거래제한)
 RISK_KEYWORDS = (

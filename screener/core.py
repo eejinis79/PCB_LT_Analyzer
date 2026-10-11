@@ -13,6 +13,15 @@ import numpy as np
 import pandas as pd
 
 FIELDS = ("open", "high", "low", "close", "volume", "value")
+FLOW_DAYS = 10  # 투자자별 순매수를 받아두는 최근 영업일 수 (수급 기간 슬라이더 최대값)
+INVESTORS = ("foreign", "inst")  # 외국인, 기관합계
+FLOW_MODES = {
+    "both": "외국인 + 기관 모두 순매수",
+    "either": "외국인 또는 기관 순매수",
+    "foreign": "외국인 순매수",
+    "inst": "기관 순매수",
+    "sum": "외국인+기관 합산 순매수",
+}
 
 
 @dataclass
@@ -27,6 +36,13 @@ class Panel:
     value: pd.DataFrame  # 거래대금(원)
     # index=종목코드, columns=[name, market, market_cap, shares]
     meta: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # 투자자별 일별 순매수거래대금(원): {"foreign": 날짜 x 종목, "inst": 날짜 x 종목}
+    # 최근 FLOW_DAYS 영업일만 있다. 수집 실패 시 비어 있음.
+    flows: dict = field(default_factory=dict)
+
+    @property
+    def has_flows(self) -> bool:
+        return all(k in self.flows for k in INVESTORS)
 
     @property
     def dates(self) -> pd.DatetimeIndex:
@@ -63,6 +79,13 @@ class ScreenParams:
     exclude_preferred: bool = True
     exclude_spac: bool = True
 
+    # 수급 (외국인·기관 순매수)
+    flow_enabled: bool = False
+    flow_mode: str = "either"      # FLOW_MODES 의 키
+    flow_days: int = 3             # 순매수 집계 기간 (기준일 포함 최근 N 영업일)
+    flow_min_eok: float = 0.0      # 기간 순매수금액 하한 (억원). 0 이면 '순매수(>0)'만 요구
+    flow_min_buy_days: int = 1     # 기간 중 순매수한 날 수 하한
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["markets"] = list(self.markets)
@@ -84,13 +107,43 @@ class ScreenParams:
 
 RESULT_COLUMNS = [
     "ticker", "name", "market", "close", "chg_pct", "max_daily_chg", "max_range",
-    "vol_ratio", "recent_vol", "base_vol", "value_eok", "mcap_eok", "box_pct", "score",
+    "vol_ratio", "recent_vol", "base_vol", "value_eok", "frg_eok", "inst_eok",
+    "frg_days", "inst_days", "mcap_eok", "box_pct", "score",
 ]
 
 
 def is_preferred(ticker: str) -> bool:
     # 보통주 코드는 끝자리 0, 우선주는 5/7/9/K 등
     return not ticker.endswith("0")
+
+
+def flow_stats(panel: Panel, days: int) -> pd.DataFrame:
+    """최근 days 영업일 투자자별 순매수 합계(억)와 순매수일 수. 수급 데이터가 없으면 빈 프레임."""
+    if not panel.has_flows:
+        return pd.DataFrame(columns=["frg_eok", "inst_eok", "frg_days", "inst_days",
+                                     "sum_eok", "sum_days"])
+    # 기준일(패널 마지막 날) 이전 데이터만, 최근 days 일
+    last = panel.dates[-1]
+    f = panel.flows["foreign"].loc[:last].iloc[-days:]
+    i = panel.flows["inst"].loc[:last].iloc[-days:]
+    f, i = f.align(i, join="outer", fill_value=0)
+    both = f + i
+    return pd.DataFrame({
+        "frg_eok": f.sum() / 1e8, "inst_eok": i.sum() / 1e8,
+        "frg_days": (f > 0).sum(), "inst_days": (i > 0).sum(),
+        "sum_eok": both.sum() / 1e8, "sum_days": (both > 0).sum(),
+    })
+
+
+def flow_mask(fs: pd.DataFrame, p: ScreenParams) -> pd.Series:
+    def ok(prefix: str) -> pd.Series:
+        amt, days = fs[f"{prefix}_eok"], fs[f"{prefix}_days"]
+        return (amt > 0) & (amt >= p.flow_min_eok) & (days >= p.flow_min_buy_days)
+
+    frg, inst = ok("frg"), ok("inst")
+    return {
+        "both": frg & inst, "either": frg | inst, "foreign": frg, "inst": inst, "sum": ok("sum"),
+    }[p.flow_mode]
 
 
 def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
@@ -149,6 +202,9 @@ def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
     df["market"] = meta.get("market", pd.Series(index=df.index, dtype=object)).fillna("")
     mcap = meta.get("market_cap", pd.Series(index=df.index, dtype=float))
     df["mcap_eok"] = mcap / 1e8
+    fs = flow_stats(panel, p.flow_days).reindex(df.index)
+    for c in ("frg_eok", "inst_eok", "frg_days", "inst_days"):
+        df[c] = fs[c]
 
     m = (
         ~df["halted"]
@@ -170,6 +226,9 @@ def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
         m &= ~df.index.to_series().map(is_preferred)
     if p.exclude_spac:
         m &= ~df["name"].str.contains("스팩", na=False)
+    if p.flow_enabled:
+        # 수급 데이터가 없는 종목/패널은 조건을 만족하지 못한 것으로 본다
+        m &= flow_mask(fs, p).fillna(False).astype(bool)
 
     out = df[m.fillna(False)].copy()
     # 거래량 배수가 클수록, 가격 움직임이 작을수록 높은 점수

@@ -75,3 +75,44 @@ def test_demo_panel_has_hits():
 
 def test_short_panel_returns_empty():
     assert run_screen(make_panel(2), ScreenParams()).empty
+
+
+def add_flows(pnl, frg_last, inst_last):
+    """000010 의 최근 3일 외국인/기관 순매수(원) 설정."""
+    idx = pnl.dates[-10:]
+    f = pd.DataFrame(0.0, index=idx, columns=pnl.close.columns)
+    i = f.copy()
+    f.iloc[-3:, 0] = frg_last
+    i.iloc[-3:, 0] = inst_last
+    pnl.flows = {"foreign": f, "inst": i}
+    return pnl
+
+
+@pytest.mark.parametrize("mode,frg,inst,hit", [
+    ("both", 1e8, 1e8, True), ("both", 1e8, -1e8, False),
+    ("either", 1e8, -1e8, True), ("either", -1e8, -1e8, False),
+    ("foreign", 1e8, -5e8, True), ("inst", 1e8, -5e8, False),
+    ("sum", 2e8, -1e8, True), ("sum", 1e8, -2e8, False),
+])
+def test_flow_modes(mode, frg, inst, hit):
+    pnl = add_flows(make_panel(), frg, inst)
+    out = run_screen(pnl, ScreenParams(flow_enabled=True, flow_mode=mode))
+    assert ("000010" in set(out["ticker"])) is hit
+
+
+def test_flow_amount_and_days():
+    pnl = add_flows(make_panel(), 1e8, 0)   # 3일 x 1억 = 3억, 순매수 3일
+    base = dict(flow_enabled=True, flow_mode="foreign")
+    row = run_screen(pnl, ScreenParams(**base)).iloc[0]
+    assert row["frg_eok"] == pytest.approx(3.0) and row["frg_days"] == 3
+    assert len(run_screen(pnl, ScreenParams(**base, flow_min_eok=3.0, flow_min_buy_days=3))) == 1
+    assert run_screen(pnl, ScreenParams(**base, flow_min_eok=3.5)).empty
+    assert run_screen(pnl, ScreenParams(**base, flow_min_buy_days=4)).empty
+    # 집계 기간 1일이면 1억
+    assert run_screen(pnl, ScreenParams(**base, flow_days=1)).iloc[0]["frg_eok"] == pytest.approx(1.0)
+
+
+def test_flow_enabled_without_data_returns_empty():
+    out = run_screen(make_panel(), ScreenParams(flow_enabled=True))
+    assert out.empty
+    assert pd.isna(run_screen(make_panel(), ScreenParams()).iloc[0]["frg_eok"])

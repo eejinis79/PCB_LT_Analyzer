@@ -1,0 +1,41 @@
+name: Build executable
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  windows-exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: python build_exe.py
+      - name: Smoke test (데모 데이터로 실행 → 스크리닝 결과 확인 후 종료)
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process dist/VolumeSpikeScreener.exe -ArgumentList '--selftest' -Wait -PassThru
+          Get-Content "$env:APPDATA/VolumeSpikeScreener/screener.log" -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "selftest exit code $($p.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VolumeSpikeScreener-windows
+          path: dist/VolumeSpikeScreener.exe

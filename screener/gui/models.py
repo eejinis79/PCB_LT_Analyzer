@@ -18,6 +18,10 @@ COLUMNS = [
     ("max_daily_chg", "최대일등락%", "{:.2f}", "최근 구간 일별 등락률 절대값의 최대"),
     ("max_range", "일중변동%", "{:.2f}", "최근 구간 (고가-저가)/전일종가 최대"),
     ("vol_ratio", "거래량배수", "{:.1f}x", "최근 구간 평균 거래량 / 평소 거래량"),
+    ("frg_eok", "외국인(억)", "{:+,.1f}", "수급 집계 기간 외국인 순매수 금액"),
+    ("inst_eok", "기관(억)", "{:+,.1f}", "수급 집계 기간 기관합계 순매수 금액"),
+    ("frg_days", "외국인일", "{:.0f}", "수급 집계 기간 중 외국인 순매수일 수"),
+    ("inst_days", "기관일", "{:.0f}", "수급 집계 기간 중 기관 순매수일 수"),
     ("recent_vol", "최근거래량", "{:,.0f}", ""),
     ("base_vol", "평소거래량", "{:,.0f}", ""),
     ("value_eok", "거래대금(억)", "{:,.1f}", "최근 구간 평균 거래대금"),
@@ -59,7 +63,7 @@ class ResultsModel(QAbstractTableModel):
         if not index.isValid():
             return None
         col, _, fmt, _ = COLUMNS[index.column()]
-        v = self.df.iat[index.row(), index.column()]
+        v = self.df[col].iat[index.row()]
         if role == Qt.DisplayRole:
             if isinstance(v, float) and math.isnan(v):
                 return "–"
@@ -69,7 +73,7 @@ class ResultsModel(QAbstractTableModel):
         if role == Qt.TextAlignmentRole:
             return int((Qt.AlignRight if col in NUMERIC else Qt.AlignLeft) | Qt.AlignVCenter)
         if role == Qt.ForegroundRole:
-            if col == "chg_pct" and isinstance(v, float):
+            if col in ("chg_pct", "frg_eok", "inst_eok") and isinstance(v, float):
                 return QColor(T.UP if v > 0 else T.DOWN if v < 0 else T.MUTED)
             if col == "vol_ratio":
                 return QColor(T.WARN if v >= 5 else T.ACCENT)

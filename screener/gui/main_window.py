@@ -7,14 +7,15 @@ import pandas as pd
 from PySide6.QtCore import QDate, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog, QFileDialog,
+    QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSplitter, QTableView, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .. import credentials
-from ..core import Panel, ScreenParams, run_screen
+from ..core import FLOW_DAYS, FLOW_MODES, Panel, ScreenParams, run_screen
+from ..vault import Credentials, Vault
+from . import account
 from . import theme as T
 from .chart import ChartWidget
 from .models import COLUMNS, ResultsModel, ResultsProxy
@@ -27,45 +28,13 @@ PRESETS: dict[str, ScreenParams] = {
         recent_days=3, vol_ratio_min=2.5, price_chg_max=3.0, daily_chg_max=3.0, range_max=5.0),
     "강한 급증 · 5배 이상 + ±1%": ScreenParams(
         vol_ratio_min=5.0, price_chg_max=1.0, daily_chg_max=1.5, range_max=4.0),
+    "매집 확인 · 급증 + 보합 + 외국인/기관 순매수": ScreenParams(
+        recent_days=1, vol_ratio_min=3.0, price_chg_max=2.0,
+        flow_enabled=True, flow_mode="either", flow_days=3, flow_min_eok=1.0, flow_min_buy_days=1),
     "박스권 내 거래량 급증": ScreenParams(
         base_days=40, vol_ratio_min=3.0, price_chg_max=2.5, use_box=True, box_range_max=12.0),
 }
 
-
-class AccountDialog(QDialog):
-    def __init__(self, creds: credentials.Credentials, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("계정 설정")
-        self.setMinimumWidth(440)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 20, 20, 20)
-        form = QFormLayout()
-        form.setSpacing(10)
-        self.krx_id = QLineEdit(creds.krx_id)
-        self.krx_pw = QLineEdit(creds.krx_pw)
-        self.krx_pw.setEchoMode(QLineEdit.Password)
-        self.dart_key = QLineEdit(creds.dart_key)
-        self.dart_key.setEchoMode(QLineEdit.Password)
-        self.dart_key.setPlaceholderText("OpenDART 인증키 40자리 (ID/PW 아님)")
-        form.addRow("KRX ID", self.krx_id)
-        form.addRow("KRX 비밀번호", self.krx_pw)
-        form.addRow("DART API 키", self.dart_key)
-        lay.addLayout(form)
-        hint = QLabel("• KRX 계정은 data.krx.co.kr 정보데이터시스템 로그인용입니다.\n"
-                      "• DART 는 opendart.fss.or.kr 로그인 → 인증키 신청/관리에서 받은 키를 넣으세요.\n"
-                      "• '저장'을 체크하면 프로젝트 폴더의 .env 파일(git 제외)에 평문으로 저장됩니다.")
-        hint.setObjectName("CardHint")
-        lay.addWidget(hint)
-        self.save_chk = QCheckBox("이 PC 의 .env 에 저장")
-        lay.addWidget(self.save_chk)
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-
-    def result_creds(self) -> credentials.Credentials:
-        return credentials.Credentials(self.krx_id.text().strip(), self.krx_pw.text(),
-                                       self.dart_key.text().strip())
 
 
 class MainWindow(QMainWindow):
@@ -74,7 +43,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Volume Spike Screener — 거래량 급증 · 가격 횡보 스크리너")
         self.resize(1480, 900)
         self.settings = QSettings("PCB_LT_Analyzer", "VolumeSpikeScreener")
-        self.creds = credentials.load()
+        self.vault = Vault()
+        self.creds: Credentials | None = None   # 잠금 해제 전에는 None
+        self.session_pw: str | None = None
         self.panel: Panel | None = None
         self.result = pd.DataFrame()
         self._loader: LoadWorker | None = None
@@ -112,6 +83,17 @@ class MainWindow(QMainWindow):
         self._restore_params()
         export = QAction("CSV 내보내기", self, shortcut=QKeySequence("Ctrl+S"), triggered=self.export_csv)
         self.addAction(export)
+
+    def shutdown(self):
+        """백그라운드 스레드가 끝날 때까지 기다린다 (종료 시 크래시 방지)."""
+        for w in [self._loader, *self._dart_workers]:
+            if w is not None and w.isRunning():
+                w.wait(5000)
+        self.chart.fig.clear()
+
+    def closeEvent(self, e):
+        self.shutdown()
+        super().closeEvent(e)
 
     # ---------------------------------------------------------------- 레이아웃
     def _build_header(self, demo: bool) -> QFrame:
@@ -210,6 +192,27 @@ class MainWindow(QMainWindow):
         mk.body.addLayout(hbox(self.ex_pref, self.ex_spac, stretch_last=True))
         lay.addWidget(mk)
 
+        fc = Card("⑤ 수급 · 외국인/기관 순매수",
+                  f"기준일 포함 최근 N일(최대 {FLOW_DAYS}일)의 순매수 금액 합계와 순매수한 날 수로 거릅니다.")
+        self.flow_on = QCheckBox("수급 조건 사용")
+        self.flow_mode = QComboBox()
+        for key, label in FLOW_MODES.items():
+            self.flow_mode.addItem(label, key)
+        self.p_flow_days = P("집계 기간", 1, FLOW_DAYS, 1, 3, "일", 0)
+        self.p_flow_eok = P("순매수 금액 ≥", 0, 1000, 0.5, 0, "억", 1,
+                            "기간 순매수 합계 하한. 0 이면 순매수(+)이기만 하면 통과")
+        self.p_flow_buy_days = P("순매수한 날 ≥", 0, FLOW_DAYS, 1, 1, "일", 0,
+                                 "집계 기간 중 순매수(+)였던 날의 수")
+        self.flow_warn = QLabel("", objectName="CardHint")
+        self.flow_warn.setStyleSheet(f"color: {T.WARN};")
+        self.flow_warn.setWordWrap(True)
+        self.flow_warn.hide()
+        fc.body.addWidget(self.flow_on)
+        fc.body.addWidget(self.flow_mode)
+        for w in (self.p_flow_days, self.p_flow_eok, self.p_flow_buy_days, self.flow_warn):
+            fc.body.addWidget(w)
+        lay.addWidget(fc)
+
         reset = QPushButton("기본값으로 초기화", objectName="Ghost")
         reset.clicked.connect(lambda: self.set_params(ScreenParams()))
         lay.addWidget(reset)
@@ -217,9 +220,13 @@ class MainWindow(QMainWindow):
 
         for s in self._sliders():
             s.valueChanged.connect(self._schedule)
-        for c in (self.use_box, self.kospi, self.kosdaq, self.ex_pref, self.ex_spac):
+        for c in (self.use_box, self.kospi, self.kosdaq, self.ex_pref, self.ex_spac, self.flow_on):
             c.toggled.connect(self._schedule)
         self.base_stat.currentIndexChanged.connect(self._schedule)
+        self.flow_mode.currentIndexChanged.connect(self._schedule)
+        for w in (self.flow_mode, self.p_flow_days, self.p_flow_eok, self.p_flow_buy_days):
+            self.flow_on.toggled.connect(w.setEnabled)
+            w.setEnabled(False)
         self.use_box.toggled.connect(self.p_box.setEnabled)
         self.p_box.setEnabled(False)
         scroll.setWidget(inner)
@@ -295,7 +302,8 @@ class MainWindow(QMainWindow):
     def _sliders(self) -> list[ParamSlider]:
         return [self.p_base_days, self.p_recent_days, self.p_vol_min, self.p_vol_max, self.p_chg,
                 self.p_daily, self.p_range, self.p_box, self.p_value, self.p_price,
-                self.p_mcap_min, self.p_mcap_max]
+                self.p_mcap_min, self.p_mcap_max, self.p_flow_days, self.p_flow_eok,
+                self.p_flow_buy_days]
 
     def params(self) -> ScreenParams:
         markets = tuple(m for m, cb in (("KOSPI", self.kospi), ("KOSDAQ", self.kosdaq)) if cb.isChecked())
@@ -309,6 +317,9 @@ class MainWindow(QMainWindow):
             min_price=int(self.p_price.value()), mcap_min_eok=self.p_mcap_min.value(),
             mcap_max_eok=self.p_mcap_max.value(), markets=markets,
             exclude_preferred=self.ex_pref.isChecked(), exclude_spac=self.ex_spac.isChecked(),
+            flow_enabled=self.flow_on.isChecked(), flow_mode=self.flow_mode.currentData(),
+            flow_days=int(self.p_flow_days.value()), flow_min_eok=self.p_flow_eok.value(),
+            flow_min_buy_days=int(self.p_flow_buy_days.value()),
         )
 
     def set_params(self, p: ScreenParams):
@@ -318,7 +329,9 @@ class MainWindow(QMainWindow):
                  (self.p_chg, p.price_chg_max), (self.p_daily, p.daily_chg_max),
                  (self.p_range, p.range_max), (self.p_box, p.box_range_max),
                  (self.p_value, p.min_value_eok), (self.p_price, p.min_price),
-                 (self.p_mcap_min, p.mcap_min_eok), (self.p_mcap_max, p.mcap_max_eok)]
+                 (self.p_mcap_min, p.mcap_min_eok), (self.p_mcap_max, p.mcap_max_eok),
+                 (self.p_flow_days, p.flow_days), (self.p_flow_eok, p.flow_min_eok),
+                 (self.p_flow_buy_days, p.flow_min_buy_days)]
         for w, val in pairs:
             w.setValue(val)
         self.base_stat.setCurrentIndex(max(0, self.base_stat.findData(p.base_stat)))
@@ -327,6 +340,8 @@ class MainWindow(QMainWindow):
         self.kosdaq.setChecked("KOSDAQ" in p.markets)
         self.ex_pref.setChecked(p.exclude_preferred)
         self.ex_spac.setChecked(p.exclude_spac)
+        self.flow_on.setChecked(p.flow_enabled)
+        self.flow_mode.setCurrentIndex(max(0, self.flow_mode.findData(p.flow_mode)))
         self._debounce.blockSignals(False)
         self._schedule()
 
@@ -369,26 +384,51 @@ class MainWindow(QMainWindow):
             self._reload_presets()
 
     # ---------------------------------------------------------------- 데이터
-    def edit_account(self):
-        dlg = AccountDialog(self.creds, self)
-        if dlg.exec() == QDialog.Accepted:
-            self.creds = dlg.result_creds()
-            self._dart_client = None
-            if dlg.save_chk.isChecked():
-                credentials.save(self.creds)
-                self.statusBar().showMessage(f"계정 정보를 {credentials.ENV_PATH} 에 저장했습니다.", 5000)
+    def ensure_unlocked(self) -> bool:
+        """세션 중 한 번 잠금 해제하면 계정 정보를 메모리에 둔다."""
+        if self.creds is not None:
+            return True
+        res = account.unlock(self.vault, self)
+        if res is None:
+            return False
+        self.session_pw, self.creds = res
+        self._dart_client = None
+        return True
+
+    def edit_account(self, already_unlocked: bool = False):
+        """계정 화면 진입: 매번 계정 비밀번호를 확인한다."""
+        if not already_unlocked:
+            res = account.unlock(self.vault, self)
+            if res is None:
+                return
+            self.session_pw, self.creds = res
+        dlg = account.AccountDialog(self.vault, self.session_pw, self.creds, self)
+        accepted = dlg.exec() == QDialog.Accepted
+        if accepted or dlg.password != self.session_pw:
+            self.creds = dlg.creds()  # 비밀번호 변경 시에도 화면 내용이 함께 저장됨
+        self.session_pw = dlg.password
+        self._dart_client = None
+        if accepted:
+            self.statusBar().showMessage("계정 정보를 암호화하여 저장했습니다.", 5000)
+            if self._selected:
+                self._load_disclosures(self._selected)
 
     def load_data(self):
         source = self.source.currentData()
-        if source == "krx" and not (self.creds.krx_id and self.creds.krx_pw):
-            self.edit_account()
-            if not (self.creds.krx_id and self.creds.krx_pw):
+        if source == "krx":
+            if not self.ensure_unlocked():
                 return
+            if not (self.creds.krx_id and self.creds.krx_pw):
+                QMessageBox.information(self, "계정", "KRX ID/비밀번호를 먼저 입력하세요.")
+                self.edit_account(already_unlocked=True)
+                if not (self.creds.krx_id and self.creds.krx_pw):
+                    return
         p = self.params()
         # 슬라이더를 늘려도 다시 받지 않도록 여유 있게 가져온다
         days = max(60, p.required_days + 5)
         end = self.date_edit.date().toPython()
-        self._loader = LoadWorker(source, end, days, self.creds.krx_id, self.creds.krx_pw)
+        creds = self.creds or Credentials()
+        self._loader = LoadWorker(source, end, days, creds.krx_id, creds.krx_pw)
         self._loader.progress.connect(self._on_progress)
         self._loader.done.connect(self._on_loaded)
         self._loader.failed.connect(self._on_failed)
@@ -433,6 +473,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"⚠ 데이터 기간({len(self.panel.dates)}일)이 조건에 필요한 {p.required_days}일보다 짧습니다. "
                 "‘데이터 불러오기’를 다시 눌러주세요.")
+        no_flows = not self.panel.has_flows
+        self.flow_warn.setText("⚠ 투자자별 순매수 데이터가 없어 수급 조건을 만족하는 종목이 없습니다. "
+                               "데이터를 다시 불러오세요." if no_flows else "")
+        self.flow_warn.setVisible(no_flows and p.flow_enabled)
         self.result = run_screen(self.panel, p)
         self.model.set_frame(self.result)
         self.table.sortByColumn(len(COLUMNS) - 1, Qt.DescendingOrder)  # 점수 내림차순
@@ -462,14 +506,19 @@ class MainWindow(QMainWindow):
         p = self.params()
         hist = self.panel.history(row["ticker"]).iloc[-(p.required_days + 10):]
         self.chart.plot(hist, f"{row['name']} ({row['ticker']}) · {row['market']}  "
-                              f"거래량 {row['vol_ratio']:.1f}배 · {row['chg_pct']:+.2f}%",
+                              f"거래량 {row['vol_ratio']:.1f}배 · {row['chg_pct']:+.2f}%"
+                              + (f" · 외국인 {row['frg_eok']:+,.1f}억 · 기관 {row['inst_eok']:+,.1f}억"
+                                 if pd.notna(row["frg_eok"]) else ""),
                         p.recent_days, p.base_days, row["base_vol"])
         self._load_disclosures(row["ticker"])
 
     def _load_disclosures(self, ticker: str):
         self.disc.clear()
+        if self.creds is None:
+            QTreeWidgetItem(self.disc, ["", "‘계정’에서 잠금 해제하면 DART 공시 표시"])
+            return
         if not self.creds.dart_key:
-            QTreeWidgetItem(self.disc, ["", "‘계정’에 DART API 키 입력 시 공시 표시"])
+            QTreeWidgetItem(self.disc, ["", "‘계정’에 DART API 인증키 입력 시 공시 표시"])
             return
         if self._dart_client is None:
             from ..data.dart import DartClient

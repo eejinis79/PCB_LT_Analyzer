@@ -14,9 +14,12 @@ from typing import Callable
 
 import pandas as pd
 
-from ..core import Panel
+from ..core import FLOW_DAYS, Panel
+from ..paths import cache_dir
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "krx"
+CACHE_DIR = cache_dir("krx")
+# pykrx 투자자 구분 이름
+INVESTOR_NAMES = {"foreign": "외국인", "inst": "기관합계"}
 OHLCV_COLS = {"시가": "open", "고가": "high", "저가": "low", "종가": "close",
               "거래량": "volume", "거래대금": "value"}
 
@@ -83,7 +86,8 @@ def load_panel(end: dt.date, days: int, markets=("KOSPI", "KOSDAQ"),
     progress = progress or (lambda *_: None)
     today = dt.date.today()
     dates = _business_days(end, days)
-    total = len(dates) * len(markets) + len(markets)
+    flow_dates = dates[-FLOW_DAYS:]
+    total = len(dates) * len(markets) + len(markets) + len(flow_dates) * len(markets) * len(INVESTOR_NAMES)
     frames: dict[str, list[pd.DataFrame]] = {}
     market_of: dict[str, str] = {}
     step = 0
@@ -120,10 +124,47 @@ def load_panel(end: dt.date, days: int, markets=("KOSPI", "KOSDAQ"),
     meta["market"] = pd.Series(market_of)
     meta["market_cap"] = cap["시가총액"].reindex(meta.index)
     meta["shares"] = cap["상장주식수"].reindex(meta.index)
+    flows, step = _load_flows(stock, [d for d in flow_dates if d in frames], markets,
+                              progress, step, total, sleep)
     progress(total, total, "종목명 매핑")
     meta["name"] = [_safe_name(stock, t) for t in meta.index]
     # 상장 전/거래정지 등 결측은 NaN 으로 둔다 (0 으로 채우면 평소 거래량이 왜곡됨)
-    return Panel(**wide, meta=meta)
+    return Panel(**wide, meta=meta, flows=flows)
+
+
+def _fetch_flow_day(stock, date: str, market: str, investor: str, use_cache: bool) -> pd.Series:
+    path = CACHE_DIR / f"flow_{date}_{market}_{investor}.pkl"
+    if use_cache and path.exists():
+        return pd.read_pickle(path)
+    df = stock.get_market_net_purchases_of_equities_by_ticker(
+        date, date, market=market, investor=INVESTOR_NAMES[investor])
+    s = df["순매수거래대금"].astype(float) if df is not None and not df.empty else pd.Series(dtype=float)
+    if use_cache and not s.empty:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        s.to_pickle(path)
+    return s
+
+
+def _load_flows(stock, dates, markets, progress, step, total, sleep):
+    """최근 영업일별 외국인/기관 순매수거래대금. 실패해도 시세 로딩은 계속한다(빈 dict)."""
+    today = dt.date.today().strftime("%Y%m%d")
+    out = {}
+    try:
+        for inv in INVESTOR_NAMES:
+            rows = {}
+            for date in dates:
+                parts = []
+                for market in markets:
+                    step += 1
+                    progress(step, total, f"{date} {market} {INVESTOR_NAMES[inv]} 순매수 수집")
+                    parts.append(_fetch_flow_day(stock, date, market, inv, use_cache=date != today))
+                    time.sleep(sleep)
+                rows[pd.Timestamp(date)] = pd.concat(parts)
+            out[inv] = pd.DataFrame(rows).T.sort_index().fillna(0)
+    except Exception as e:  # noqa: BLE001
+        print(f"투자자별 순매수 수집 실패 (수급 조건 사용 불가): {e}")
+        return {}, step
+    return out, step
 
 
 def _safe_name(stock, ticker: str) -> str:

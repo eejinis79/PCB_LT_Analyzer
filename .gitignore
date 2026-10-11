@@ -4,3 +4,6 @@ __pycache__/
 .cache/
 *.csv
 .pytest_cache/
+build/
+dist/
+*.spec

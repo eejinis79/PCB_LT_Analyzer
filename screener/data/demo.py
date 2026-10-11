@@ -6,7 +6,7 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 
-from ..core import Panel
+from ..core import FLOW_DAYS, Panel
 
 _NAMES = ["가온", "누리", "다솜", "라온", "마루", "바다", "새봄", "아라", "자람", "하늘",
           "한빛", "윤슬", "온새", "미르", "도담", "별하", "솔찬", "여울", "은결", "푸름"]
@@ -53,7 +53,17 @@ def load_panel(end: dt.date | None = None, days: int = 60, n_tickers: int = 400,
         "market_cap": close[-1] * shares,
         "shares": shares,
     }, index=tickers)
+    # 투자자별 순매수(원): 평소엔 잡음, 패턴 종목 절반은 외국인/기관이 최근에 받아간 것으로
+    value = volume * close
+    flow_idx = dates[-FLOW_DAYS:]
+    frg = rng.normal(0, 0.04, (FLOW_DAYS, n_tickers)) * value[-FLOW_DAYS:]
+    inst = rng.normal(0, 0.03, (FLOW_DAYS, n_tickers)) * value[-FLOW_DAYS:]
+    accum = planted[: len(planted) // 2]
+    frg[-3:, accum] = np.abs(frg[-3:, accum]) + 0.08 * value[-3:, accum]
+    inst[-3:, accum[::2]] = np.abs(inst[-3:, accum[::2]]) + 0.05 * value[-3:, accum[::2]]
+    flows = {"foreign": pd.DataFrame(np.round(frg), index=flow_idx, columns=tickers),
+             "inst": pd.DataFrame(np.round(inst), index=flow_idx, columns=tickers)}
     if progress:
         progress(1, 1, "데모 데이터 생성 완료")
     return Panel(open=df(open_), high=df(high), low=df(low), close=df(close),
-                 volume=df(volume), value=df(volume * close), meta=meta)
+                 volume=df(volume), value=df(value), meta=meta, flows=flows)

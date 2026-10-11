@@ -4,29 +4,51 @@
 거래량 배수와 가격 허용 범위를 슬라이더로 조정하면 결과가 즉시 다시 계산됩니다.
 
 - 시세: KRX 정보데이터시스템 (KRX 계정 로그인, [pykrx](https://github.com/sharebook-kr/pykrx) 사용)
+- 수급: 외국인 · 기관 순매수 조건 (최근 1~10영업일 순매수 금액·순매수일 수)
 - 공시: OpenDART API (선택 종목의 최근 90일 공시, 위험/호재 공시 색상 표시)
+- 계정: KRX / DART 계정·비밀번호·API 인증키를 **계정 비밀번호로 암호화**해 저장
 - 다른 상승 후보 스크리닝 방법 검토: [`docs/screening_strategies_review.md`](docs/screening_strategies_review.md)
 
 ![screenshot](docs/screenshot.png)
 
-## 설치 · 실행
+## 실행파일(.exe)로 쓰기
+
+| 방법 | 설명 |
+|---|---|
+| GitHub Actions | 브랜치에 push 하면 **Build executable** 워크플로가 Windows 용 `VolumeSpikeScreener.exe` 를 만들어 *Artifacts* 에 올립니다. (Actions 탭 → 실행 → `VolumeSpikeScreener-windows` 다운로드) |
+| 직접 빌드 (Windows) | `build_exe.bat` 더블클릭 → `dist\VolumeSpikeScreener.exe` |
+| 직접 빌드 (공통) | `pip install -r requirements.txt pyinstaller` 후 `python build_exe.py` |
+
+exe 하나로 동작하며 Python 설치가 필요 없습니다. 계정 금고·시세 캐시·로그는
+`%APPDATA%\VolumeSpikeScreener\` (macOS: `~/Library/Application Support/…`, Linux: `~/.local/share/…`) 에 저장됩니다.
+
+## 소스로 실행
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # KRX_ID / KRX_PW / DART_API_KEY 입력 (또는 GUI '계정' 버튼에서 입력)
-python run_screener.py      # KRX 실데이터
+python run_screener.py          # KRX 실데이터
 python run_screener.py --demo   # 계정/네트워크 없이 합성 데이터로 UI 확인
 ```
 
-> **DART 는 ID/PW 가 아니라 API 인증키를 씁니다.** opendart.fss.or.kr 에 로그인 → *인증키 신청/관리* 에서 40자리 키를 발급받아 넣으세요.
-> 계정 정보는 `.env`(git 제외)에만 저장되며, 저장하지 않으면 실행 중 메모리에만 있습니다.
+## 계정 · 비밀번호
+
+1. 상단 **계정** 버튼 → 계정 비밀번호 입력. **초기 비밀번호는 `0000`** 입니다.
+2. `0000` 으로 처음 접속하면 **새 비밀번호 설정 화면이 강제로 뜹니다** (4자 이상, 0000 불가). 변경하지 않으면 계정 화면에 들어갈 수 없습니다.
+3. 계정 화면에서 KRX ID/비밀번호, DART ID/비밀번호, **DART API 인증키**를 입력 → 저장.
+4. 계정 화면의 **계정 비밀번호 변경** 버튼으로 언제든 변경 (현재 비밀번호 확인 필요).
+5. 계정 화면은 들어갈 때마다 비밀번호를 묻습니다. KRX 데이터 불러오기는 실행 중 한 번만 잠금 해제하면 됩니다.
+6. 비밀번호 5회 오류 시 30초 잠금. 잊은 경우 *비밀번호를 잊었어요(초기화)* → 저장된 계정 정보가 삭제되고 0000 으로 돌아갑니다.
+
+저장 방식: 계정 비밀번호 → PBKDF2-SHA256(60만 회) 키 유도 → Fernet(AES) 암호화. 디스크에 평문 비밀번호는 남지 않습니다.
+
+> **DART 는 ID/PW 가 아니라 API 인증키로 조회합니다.** opendart.fss.or.kr 로그인 → *인증키 신청/관리* 에서 40자리 키를 발급받아 넣으세요. (DART ID/PW 는 보관용으로만 저장)
 
 ## 화면 구성
 
 | 영역 | 내용 |
 |---|---|
-| 상단 | 데이터 소스(KRX/데모), 기준일, 데이터 불러오기, 계정, CSV 내보내기 |
-| 왼쪽 | 조건 카드 — ① 거래량 ② 가격 ③ 유동성·규모 ④ 시장·제외, 프리셋 저장/불러오기 |
+| 상단 | 데이터 소스(KRX/데모), 기준일, 데이터 불러오기, 계정(비밀번호 잠금), CSV 내보내기 |
+| 왼쪽 | 조건 카드 — ① 거래량 ② 가격 ③ 유동성·규모 ④ 시장·제외 ⑤ 수급(외국인·기관), 프리셋 저장/불러오기 |
 | 가운데 | 결과 요약 칩, 종목 검색, 결과 테이블(컬럼 클릭 정렬, 더블클릭 → 네이버 금융) |
 | 아래 | 선택 종목 캔들+거래량 차트(파랑 음영=평소 구간, 주황=급증 구간), DART 공시 목록 |
 
@@ -48,13 +70,20 @@ python run_screener.py --demo   # 계정/네트워크 없이 합성 데이터로
 | 박스권(선택) | 기준 구간 (최고−최저 종가)/평균 | 15% 이내 |
 | 유동성 | 최근 평균 거래대금, 주가, 시가총액 범위 | 5억↑, 1,000원↑ |
 | 제외 | 우선주, 스팩, 최근 구간 거래정지 종목 | 제외 |
+| 수급 사용 | 외국인·기관 순매수 조건 켜기 | 꺼짐 |
+| 수급 방식 | 외국인+기관 모두 / 외국인 또는 기관 / 외국인 / 기관 / 외국인+기관 합산 | 외국인 또는 기관 |
+| 수급 집계 기간 | 기준일 포함 최근 N 영업일 (1~10) | 3일 |
+| 순매수 금액 | 기간 순매수 합계 하한 (억원, 0 = 순매수이기만 하면 통과) | 0억 |
+| 순매수한 날 | 기간 중 순매수(+)였던 날 수 하한 | 1일 |
 
 점수 = `log2(거래량배수) × 10 / (1 + |기간등락률| + 0.5 × 일중변동폭)` — 거래량이 클수록, 가격이 덜 움직일수록 높음.
 
 ## 데이터 수집 방식
 
-날짜별 '전종목 시세'를 시장별로 한 번씩 받아(약 60영업일 × 2시장 ≈ 120회 호출) 패널로 합칩니다.
-지난 영업일 데이터는 `.cache/krx/` 에 저장되어 두 번째 실행부터는 거의 즉시 로드됩니다.
+날짜별 '전종목 시세'를 시장별로 한 번씩 받아(약 60영업일 × 2시장 ≈ 120회 호출) 패널로 합치고,
+최근 10영업일의 외국인·기관합계 순매수(10일 × 2시장 × 2투자자 = 40회)를 함께 받습니다.
+지난 영업일 데이터는 사용자 폴더의 `cache/` 에 저장되어 두 번째 실행부터는 거의 즉시 로드됩니다.
+순매수 수집이 실패해도 시세 스크리닝은 그대로 동작하며, 수급 조건 카드에 경고가 표시됩니다.
 조건 슬라이더 조정은 네트워크 호출 없이 메모리에서만 다시 계산합니다.
 
 ## 테스트
@@ -66,12 +95,15 @@ python -m pytest -q
 ## 구조
 
 ```
-run_screener.py            # 실행 진입점
-screener/core.py           # 스크리닝 로직 (pandas, GUI 독립)
+run_screener.py            # 실행 진입점 (--demo, --selftest)
+build_exe.py / build_exe.bat   # PyInstaller 실행파일 빌드
+screener/core.py           # 스크리닝 로직 (pandas, GUI 독립) — 거래량/가격/수급 조건
+screener/vault.py          # 계정 정보 암호화 금고 (초기 비밀번호 0000)
+screener/paths.py          # 사용자 데이터 폴더
 screener/data/krx.py       # KRX 로그인 + 시세 패널 수집/캐시
 screener/data/dart.py      # OpenDART 공시 조회·분류
 screener/data/demo.py      # 오프라인 합성 데이터
-screener/gui/              # PySide6 GUI (테마, 위젯, 차트, 테이블 모델, 워커)
+screener/gui/              # PySide6 GUI (테마, 위젯, 차트, 테이블 모델, 워커, 계정 화면)
 docs/screening_strategies_review.md   # 추가 스크리닝 방법 검토
 ```
 
