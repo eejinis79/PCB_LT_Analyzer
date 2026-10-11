@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 REM 더블클릭으로 실행: 처음 한 번은 필요한 패키지를 설치합니다 (수 분 소요).
-cd /d %~dp0
+cd /d "%~dp0"
 
 where python >nul 2>nul
 if errorlevel 1 (
@@ -27,6 +27,7 @@ if not exist .venv\installed.flag (
 
 echo 프로그램을 시작합니다. 데이터 없이 화면만 보려면: run_windows.bat --demo
 python run_screener.py %*
+if errorlevel 1 pause
 exit /b 0
 
 :error

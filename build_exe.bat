@@ -1,6 +1,6 @@
 @echo off
 REM Windows 에서 더블클릭하면 dist\VolumeSpikeScreener.exe 가 만들어집니다.
-cd /d %~dp0
+cd /d "%~dp0"
 python -m pip install -r requirements.txt pyinstaller || goto :error
 python build_exe.py || goto :error
 echo.
