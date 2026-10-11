@@ -31,6 +31,20 @@ exe 하나로 동작하며 Python 설치가 필요 없습니다. 계정 금고·
 3. 처음 한 번은 필요한 패키지를 자동 설치합니다(수 분). 이후에는 바로 실행됩니다.
 4. 데이터 없이 화면만 보려면 `run_windows.bat --demo` / `./run_mac_linux.sh --demo`
 
+### 파일 하나로 실행 · 수정 (`volume_spike_screener.py`)
+
+다른 PC 에서 검증하거나 직접 고칠 때는 **`volume_spike_screener.py` 파일 하나만** 복사하면 됩니다.
+
+```bash
+pip install pandas numpy requests pykrx PySide6 matplotlib cryptography
+python volume_spike_screener.py --demo     # 데모
+python volume_spike_screener.py            # KRX 실데이터
+```
+
+이 파일은 `screener/` 패키지를 `python tools/build_single_py.py` 로 합친 배포본입니다.
+파일 안의 `# ====` 구분선 아래에 원래 모듈 경로가 적혀 있습니다.
+(패키지를 고친 뒤에는 다시 생성해야 하며, 테스트가 불일치를 잡아냅니다.)
+
 ### 직접 명령으로 실행
 
 ```bash
@@ -105,6 +119,7 @@ python -m pytest -q
 
 ```
 run_screener.py            # 실행 진입점 (--demo, --selftest)
+volume_spike_screener.py   # 단일 파일 배포본 (tools/build_single_py.py 로 생성)
 build_exe.py / build_exe.bat   # PyInstaller 실행파일 빌드
 screener/core.py           # 스크리닝 로직 (pandas, GUI 독립) — 거래량/가격/수급 조건
 screener/vault.py          # 계정 정보 암호화 금고 (초기 비밀번호 0000)
