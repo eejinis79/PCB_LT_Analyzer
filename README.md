@@ -5,9 +5,9 @@
 
 - 시세: KRX 정보데이터시스템 (KRX 계정 로그인, [pykrx](https://github.com/sharebook-kr/pykrx) 사용)
 - 공시: OpenDART API (선택 종목의 최근 90일 공시, 위험/호재 공시 색상 표시)
-![screenshot](docs/screenshot.png)
-
 - 다른 상승 후보 스크리닝 방법 검토: [`docs/screening_strategies_review.md`](docs/screening_strategies_review.md)
+
+![screenshot](docs/screenshot.png)
 
 ## 설치 · 실행
 
