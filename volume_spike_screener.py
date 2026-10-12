@@ -638,6 +638,18 @@ class StockDB:
         with self._conn() as c:
             return pd.read_sql_query(q, c, params=[asof] if asof else [])
 
+    def list_runs(self) -> pd.DataFrame:
+        with self._conn() as c:
+            return pd.read_sql_query(
+                "SELECT run_id, asof, saved_at, source, params, n_hits FROM screen_runs "
+                "ORDER BY asof DESC, run_id DESC", c)
+
+    def load_prices_since(self, start: str) -> pd.DataFrame:
+        """start(YYYYMMDD) 이후 전종목 시세 (long). 성과 계산용."""
+        with self._conn() as c:
+            return pd.read_sql_query(
+                "SELECT date, ticker, open, high, low, close FROM ohlcv WHERE date >= ?", c, params=[start])
+
     # ------------------------------------------------------------ 상태
     def stats(self) -> dict:
         with self._conn() as c:
@@ -672,6 +684,137 @@ class StockDB:
             except Exception as e:  # noqa: BLE001 — 깨진 캐시 파일은 건너뜀
                 print(f"캐시 이전 실패 {p.name}: {e}")
         return n
+
+
+# ============================================================================
+# screener/performance.py
+# ============================================================================
+"""저장한 스크리닝 신호의 이후 수익률 계산.
+
+신호일(기준일) 이후 DB 에 쌓인 시세로 N 영업일 뒤 수익률, 기간 중 최고/최저,
+같은 기간 시장(전종목 동일가중 평균) 수익률 대비 초과수익을 구한다.
+데이터는 매일 '데이터 불러오기'를 할 때 DB 에 쌓이므로, 신호 이후 날짜가 쌓일수록 칸이 채워진다.
+"""
+
+import numpy as np
+import pandas as pd
+
+HORIZONS = (1, 5, 10, 20)
+PATH_DAYS = 20          # 평균 누적수익률 곡선 / 최고·최저 계산 구간
+ENTRY_MODES = {"close": "신호일 종가", "next_open": "다음날 시가"}
+
+
+def _wide(prices: pd.DataFrame, field: str) -> pd.DataFrame:
+    w = prices.pivot(index="date", columns="ticker", values=field).sort_index()
+    return w.replace(0, np.nan)  # 거래정지(0) 는 결측으로
+
+
+def compute(signals: pd.DataFrame, prices: pd.DataFrame, entry: str = "close",
+            horizons=HORIZONS) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    signals: asof, ticker (+ name, market, vol_ratio, chg_pct 등) — db.load_results() 형태
+    prices : date, ticker, open, high, low, close — db.load_prices_since() 형태
+
+    반환 (detail, summary, path)
+      detail : 신호별 진입가 · r{N} · bench{N} · max_gain · max_loss · last_ret · held
+      summary: 기간별 표본수 · 평균 · 중앙값 · 승률 · 시장평균 · 초과수익
+      path   : day(1..20) 별 신호 평균 누적수익률과 시장 평균
+    """
+    cols = [f"r{h}" for h in horizons]
+    if signals.empty or prices.empty:
+        empty = signals.assign(**{c: np.nan for c in cols})
+        return empty, pd.DataFrame(), pd.DataFrame()
+
+    close, open_ = _wide(prices, "close"), _wide(prices, "open")
+    high, low = _wide(prices, "high"), _wide(prices, "low")
+    dates = list(close.index)
+    pos = {d: i for i, d in enumerate(dates)}
+    n = len(dates)
+
+    # 시장 평균: 날짜 i 에서 N 일 뒤 전종목 동일가중 평균 수익률 (진입 기준: 종가)
+    max_h = max(max(horizons), PATH_DAYS)
+    bench = {k: (close.shift(-k) / close - 1).mean(axis=1) for k in range(1, max_h + 1)}
+
+    rows = []
+    for sig in signals.itertuples(index=False):
+        d, t = str(sig.asof), sig.ticker
+        rec = {"asof": d, "ticker": t}
+        i = pos.get(d)
+        if i is None or t not in close.columns:
+            rows.append(rec)
+            continue
+        if entry == "next_open":
+            e_idx = i + 1
+            entry_px = open_[t].iloc[e_idx] if e_idx < n else np.nan
+        else:
+            e_idx = i
+            entry_px = close[t].iloc[i]
+        rec["entry"] = entry_px
+        if pd.isna(entry_px):
+            rows.append(rec)
+            continue
+        for h in horizons:
+            j = i + h
+            if j < n and j >= e_idx:
+                rec[f"r{h}"] = close[t].iloc[j] / entry_px - 1
+                rec[f"bench{h}"] = bench[h].iloc[i]
+        window = slice(e_idx + (0 if entry == "next_open" else 1), min(i + PATH_DAYS, n - 1) + 1)
+        hi, lo = high[t].iloc[window], low[t].iloc[window]
+        if len(hi.dropna()):
+            rec["max_gain"] = hi.max() / entry_px - 1
+            rec["max_loss"] = lo.min() / entry_px - 1
+        rec["last_ret"] = close[t].iloc[-1] / entry_px - 1
+        rec["held"] = n - 1 - i
+        for k in range(1, PATH_DAYS + 1):
+            if i + k < n:
+                rec[f"p{k}"] = close[t].iloc[i + k] / entry_px - 1
+                rec[f"pb{k}"] = bench[k].iloc[i]
+        rows.append(rec)
+
+    # 신호 행과 1:1 (같은 날 같은 종목이 여러 번 있어도 행이 불어나지 않게 위치로 붙임)
+    perf = pd.DataFrame(rows, index=range(len(rows))).drop(columns=["asof", "ticker"])
+    base = signals.reset_index(drop=True).assign(asof=signals["asof"].astype(str).values)
+    detail = pd.concat([base.drop(columns=[c for c in perf.columns if c in base.columns]), perf], axis=1)
+    for c in cols + [f"bench{h}" for h in horizons] + ["entry", "max_gain", "max_loss", "last_ret", "held"]:
+        if c not in detail:
+            detail[c] = np.nan
+
+    summary = []
+    for h in horizons:
+        r = detail[f"r{h}"].dropna()
+        b = detail.loc[r.index, f"bench{h}"]
+        summary.append({
+            "horizon": h, "n": len(r),
+            "mean": r.mean() if len(r) else np.nan,
+            "median": r.median() if len(r) else np.nan,
+            "win_rate": (r > 0).mean() if len(r) else np.nan,
+            "bench": b.mean() if len(r) else np.nan,
+            "excess": (r - b).mean() if len(r) else np.nan,
+        })
+    summary = pd.DataFrame(summary)
+
+    path = pd.DataFrame({
+        "day": range(1, PATH_DAYS + 1),
+        "signal": [detail.get(f"p{k}", pd.Series(dtype=float)).mean() for k in range(1, PATH_DAYS + 1)],
+        "bench": [detail.get(f"pb{k}", pd.Series(dtype=float)).mean() for k in range(1, PATH_DAYS + 1)],
+        "n": [detail.get(f"p{k}", pd.Series(dtype=float)).notna().sum() for k in range(1, PATH_DAYS + 1)],
+    })
+    detail = detail.drop(columns=[c for c in detail.columns if c[:1] == "p" and c[1:].isdigit()
+                                  or c.startswith("pb") and c[2:].isdigit()])
+    return detail, summary, path
+
+
+def from_db(db, run_ids=None, entry: str = "close", dedupe: bool = True):
+    """DB 에서 신호와 시세를 읽어 compute(). run_ids=None 이면 전체."""
+    sig = db.load_results()
+    if run_ids is not None:
+        sig = sig[sig["run_id"].isin(run_ids)]
+    if dedupe and not sig.empty:  # 같은 날 같은 종목이 여러 조건에서 잡혀도 한 번만
+        sig = sig.sort_values(["asof", "run_id", "rank"]).drop_duplicates(["asof", "ticker"])
+    if sig.empty:
+        return compute(sig, pd.DataFrame(), entry)
+    prices = db.load_prices_since(str(sig["asof"].min()))
+    return compute(sig, prices, entry)
 
 
 # ============================================================================
@@ -1931,6 +2074,256 @@ class DbDialog(QDialog):
 
 
 # ============================================================================
+# screener/gui/performance_view.py
+# ============================================================================
+"""저장한 신호의 이후 수익률 화면."""
+
+import json
+import math
+
+import pandas as pd
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtWidgets import (
+    QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QPushButton, QSplitter, QTableView, QVBoxLayout,
+)
+
+
+# (컬럼, 헤더, 형식) — 형식 "pct" 는 수익률(색 표시)
+DETAIL_COLUMNS = [
+    ("asof", "신호일", "date"), ("ticker", "코드", "str"), ("name", "종목명", "str"),
+    ("market", "시장", "str"), ("vol_ratio", "거래량배수", "{:.1f}x"), ("entry", "진입가", "{:,.0f}"),
+    ("r1", "+1일", "pct"), ("r5", "+5일", "pct"), ("r10", "+10일", "pct"), ("r20", "+20일", "pct"),
+    ("max_gain", "20일 최고", "pct"), ("max_loss", "20일 최저", "pct"),
+    ("last_ret", "현재까지", "pct"), ("held", "경과일", "{:.0f}"),
+]
+
+
+def _params_summary(raw: str) -> str:
+    try:
+        p = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    s = f"거래량≥{p.get('vol_ratio_min', 0):g}배 · 등락±{p.get('price_chg_max', 0):g}% · 최근{p.get('recent_days', 1)}일"
+    if p.get("flow_enabled"):
+        s += " · 수급"
+    return s
+
+
+class FrameModel(QAbstractTableModel):
+    def __init__(self, columns, parent=None):
+        super().__init__(parent)
+        self.columns = columns
+        self.df = pd.DataFrame()
+
+    def set_frame(self, df: pd.DataFrame):
+        self.beginResetModel()
+        self.df = df.reset_index(drop=True)
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.df)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.columns)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return self.columns[section][1]
+        return None
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        col, _, fmt = self.columns[index.column()]
+        v = self.df[col].iat[index.row()] if col in self.df else None
+        missing = v is None or (isinstance(v, float) and math.isnan(v))
+        if role == Qt.DisplayRole:
+            if missing:
+                return "–"
+            if fmt == "pct":
+                return f"{v * 100:+.2f}%"
+            if fmt == "date":
+                return f"{v[:4]}-{v[4:6]}-{v[6:]}"
+            if fmt == "str":
+                return str(v)
+            return fmt.format(v)
+        if role == Qt.UserRole:
+            if missing:
+                return -1e18  # 정렬 시 맨 아래로
+            return v.item() if hasattr(v, "item") else v
+        if role == Qt.TextAlignmentRole:
+            return int((Qt.AlignLeft if fmt in ("str", "date") else Qt.AlignRight) | Qt.AlignVCenter)
+        if role == Qt.ForegroundRole:
+            if fmt == "pct" and not missing:
+                return QColor(UP if v > 0 else DOWN if v < 0 else MUTED)
+            if missing or col == "market":
+                return QColor(MUTED)
+        return None
+
+
+class PerformanceDialog(QDialog):
+    def __init__(self, db_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("신호 성과 — 저장한 스크리닝 결과의 이후 수익률")
+        self.resize(1280, 820)
+        self.db = StockDB(db_path)
+        self.detail = pd.DataFrame()
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+
+        top = QHBoxLayout()
+        self.run_combo = QComboBox()
+        self.run_combo.setMinimumWidth(420)
+        self.entry_combo = QComboBox()
+        for k, v in ENTRY_MODES.items():
+            self.entry_combo.addItem(v, k)
+        refresh = QPushButton("새로고침")
+        refresh.clicked.connect(self.reload)
+        export = QPushButton("CSV 내보내기", objectName="Ghost")
+        export.clicked.connect(self.export_csv)
+        top.addWidget(QLabel("대상"))
+        top.addWidget(self.run_combo)
+        top.addWidget(QLabel("진입가"))
+        top.addWidget(self.entry_combo)
+        top.addStretch(1)
+        top.addWidget(refresh)
+        top.addWidget(export)
+        lay.addLayout(top)
+
+        self.hint = QLabel("", objectName="CardHint")
+        self.hint.setWordWrap(True)
+        lay.addWidget(self.hint)
+
+        chips = QHBoxLayout()
+        chips.setSpacing(10)
+        self.chip_n = StatChip("신호 수", color=TEXT)
+        chips.addWidget(self.chip_n)
+        self.chips = {}
+        for h in HORIZONS:
+            c = StatChip(f"+{h}일 평균 · 승률 · 시장대비", color=TEXT)
+            self.chips[h] = c
+            chips.addWidget(c)
+        chips.addStretch(1)
+        lay.addLayout(chips)
+
+        split = QSplitter(Qt.Vertical)
+        split.setHandleWidth(10)
+        self.model = FrameModel(DETAIL_COLUMNS, self)
+        self.proxy = QSortFilterProxyModel(self)
+        self.proxy.setSourceModel(self.model)
+        self.proxy.setSortRole(Qt.UserRole)
+        self.table = QTableView()
+        self.table.setModel(self.proxy)
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.setShowGrid(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for i, (c, *_r) in enumerate(DETAIL_COLUMNS):
+            self.table.setColumnWidth(i, {"asof": 96, "ticker": 70, "name": 130, "market": 70}.get(c, 86))
+        self.table.doubleClicked.connect(self._open_naver)
+        self.table.setToolTip("더블클릭: 네이버 금융")
+        split.addWidget(self.table)
+        self.chart = ChartWidget()
+        split.addWidget(self.chart)
+        split.setSizes([480, 260])
+        lay.addWidget(split, 1)
+
+        self._fill_runs()
+        self.run_combo.currentIndexChanged.connect(self.reload)
+        self.entry_combo.currentIndexChanged.connect(self.reload)
+        self.reload()
+
+    def _fill_runs(self):
+        self.run_combo.clear()
+        runs = self.db.list_runs()
+        self.run_combo.addItem(f"전체 저장 결과 ({len(runs)}회, 같은 날 같은 종목은 1번만)", None)
+        for r in runs.itertuples():
+            d = r.asof
+            self.run_combo.addItem(
+                f"{d[:4]}-{d[4:6]}-{d[6:]} · {r.n_hits}종목 · {_params_summary(r.params)}", int(r.run_id))
+
+    def reload(self):
+        run_id = self.run_combo.currentData()
+        entry = self.entry_combo.currentData() or "close"
+        detail, summary, path = from_db(
+            self.db, run_ids=None if run_id is None else [run_id], entry=entry)
+        self.detail = detail
+        self.model.set_frame(detail)
+        self.table.sortByColumn(0, Qt.DescendingOrder)
+        self.chip_n.set(f"{len(detail):,}")
+        if summary.empty:
+            for c in self.chips.values():
+                c.set("–")
+            self.hint.setText("저장된 결과가 없습니다. 메인 화면에서 KRX 데이터로 스크리닝한 뒤 "
+                              "‘결과 DB 저장’을 누르면, 이후 매일 ‘데이터 불러오기’를 할 때마다 수익률이 채워집니다.")
+            self.chart.show_message("저장된 신호가 없습니다")
+            return
+        for row in summary.itertuples():
+            if row.n == 0:
+                self.chips[row.horizon].set("데이터 대기")
+                continue
+            self.chips[row.horizon].set(
+                f"{row.mean * 100:+.1f}% · {row.win_rate * 100:.0f}% · {row.excess * 100:+.1f}%p")
+        last = self.db.stats()["last"] or ""
+        self.hint.setText(
+            "수익률 = N영업일 뒤 종가 ÷ 진입가 − 1. 시장대비 = 같은 기간 전종목(KOSPI·KOSDAQ) 동일가중 평균 수익률과의 차이. "
+            f"DB 시세 마지막 날짜: {last[:4]}-{last[4:6]}-{last[6:]} — 이후 날짜는 ‘데이터 불러오기’를 하면 채워집니다. "
+            "수수료·세금 미반영.")
+        self._plot(path)
+
+    def _plot(self, path: pd.DataFrame):
+        p = path[path["n"] > 0]
+        if p.empty:
+            self.chart.show_message("신호 이후 시세가 아직 없습니다 — 다음 거래일 이후 확인하세요")
+            return
+        fig = self.chart.fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        self.chart._style(ax)
+        ax.axhline(0, color=BORDER, linewidth=1)
+        ax.plot(p["day"], p["signal"] * 100, color=ACCENT, marker="o", markersize=3, label="신호 평균")
+        ax.plot(p["day"], p["bench"] * 100, color=MUTED, linestyle="--", label="시장 평균")
+        ax.fill_between(p["day"], p["signal"] * 100, p["bench"] * 100,
+                        where=p["signal"] >= p["bench"], color=UP, alpha=0.12, interpolate=True)
+        ax.fill_between(p["day"], p["signal"] * 100, p["bench"] * 100,
+                        where=p["signal"] < p["bench"], color=DOWN, alpha=0.12, interpolate=True)
+        ax.set_xlabel("신호 이후 영업일", color=MUTED, fontsize=9)
+        ax.set_ylabel("평균 누적수익률 (%)", color=MUTED, fontsize=9)
+        ax.set_xticks(list(p["day"]))
+        leg = ax.legend(facecolor=SURFACE, edgecolor=BORDER, fontsize=9)
+        for t in leg.get_texts():
+            t.set_color(TEXT)
+        fig.subplots_adjust(left=0.07, right=0.98, top=0.9, bottom=0.18)
+        fig.suptitle("신호 이후 평균 누적수익률 vs 시장", color=TEXT, fontsize=11, x=0.07, ha="left")
+        self.chart.draw_idle()
+
+    def _open_naver(self, idx):
+        ticker = self.proxy.index(idx.row(), 1).data()
+        QDesktopServices.openUrl(QUrl(f"https://finance.naver.com/item/main.naver?code={ticker}"))
+
+    def export_csv(self):
+        if self.detail.empty:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "CSV 저장", "signal_performance.csv", "CSV (*.csv)")
+        if path:
+            cols = [c for c, *_ in DETAIL_COLUMNS if c in self.detail]
+            out = self.detail[cols].copy()
+            for c, _h, f in DETAIL_COLUMNS:
+                if f == "pct" and c in out:
+                    out[c] = (out[c] * 100).round(2)
+            out.rename(columns={c: h for c, h, _ in DETAIL_COLUMNS}).to_csv(
+                path, index=False, encoding="utf-8-sig")
+
+
+# ============================================================================
 # screener/gui/main_window.py
 # ============================================================================
 import datetime as dt
@@ -2053,11 +2446,14 @@ class MainWindow(QMainWindow):
         save = QPushButton("결과 DB 저장", objectName="Ghost")
         save.setToolTip("현재 스크리닝 결과와 조건을 DB 에 기록 (나중에 신호 이후 수익률 추적용)")
         save.clicked.connect(self.save_results)
+        perf = QPushButton("성과", objectName="Ghost")
+        perf.setToolTip("저장한 스크리닝 결과의 이후 1·5·10·20일 수익률")
+        perf.clicked.connect(lambda: PerformanceDialog(self.db_path, self).exec())
         db_btn = QPushButton("DB", objectName="Ghost")
         db_btn.setToolTip("데이터 저장 위치 · 저장된 기간 보기 / 위치 변경")
         db_btn.clicked.connect(self.open_db_dialog)
         for w in (QLabel("소스"), self.source, QLabel("기준일"), self.date_edit,
-                  self.load_btn, acct, db_btn, save, export):
+                  self.load_btn, acct, db_btn, save, perf, export):
             lay.addWidget(w)
         return h
 

@@ -31,6 +31,12 @@ exe 하나로 동작하며 Python 설치가 필요 없습니다. 시세 DB(`stoc
 3. 처음 한 번은 필요한 패키지를 자동 설치합니다(수 분). 이후에는 바로 실행됩니다.
 4. 데이터 없이 화면만 보려면 `run_windows.bat --demo` / `./run_mac_linux.sh --demo`
 
+### 업데이트 (GitHub 에서 다시 내려받지 않고)
+
+**`update_windows.bat` 더블클릭** (또는 `python update.py`) → 최신 버전을 받아 이 폴더에 덮어씁니다.
+- 내용이 바뀌는 기존 파일은 덮어쓰기 전에 `_backup\날짜_시각\` 에 복사해 둡니다 (직접 고친 내용 보존).
+- DB(`stock_data.db`), `.venv`, 백업 폴더는 건드리지 않고, 파일을 지우지도 않습니다.
+
 ### 파일 하나로 실행 · 수정 (`volume_spike_screener.py`)
 
 다른 PC 에서 검증하거나 직접 고칠 때는 **`volume_spike_screener.py` 파일 하나만** 복사하면 됩니다.
@@ -74,6 +80,13 @@ python run_screener.py --demo   # 계정/네트워크 없이 합성 데이터로
 | 왼쪽 | 조건 카드 — ① 거래량 ② 가격 ③ 유동성·규모 ④ 시장·제외 ⑤ 수급(외국인·기관), 프리셋 저장/불러오기 |
 | 가운데 | 결과 요약 칩, 종목 검색, 결과 테이블(컬럼 클릭 정렬, 더블클릭 → 네이버 금융) |
 | 아래 | 선택 종목 캔들+거래량 차트(파랑 음영=평소 구간, 주황=급증 구간), DART 공시 목록 |
+| **성과** 버튼 | 저장한 결과의 이후 +1·5·10·20일 수익률, 20일 최고/최저, 승률, 시장 평균 대비 초과수익, 평균 누적수익률 곡선 |
+
+### 신호 성과 (성과 버튼)
+
+1. KRX 데이터로 스크리닝 → **결과 DB 저장** (매일 또는 원하는 날)
+2. 이후 매일 **데이터 불러오기**를 하면 새 날짜 시세가 DB 에 쌓이고, 성과 화면의 +1/+5/+10/+20일 칸이 채워집니다.
+3. 진입가는 *신호일 종가* 또는 *다음날 시가* 중 선택. 시장대비 = 같은 기간 전종목 동일가중 평균 수익률과의 차이. 수수료·세금 미반영.
 
 ## 조건 정의
 
@@ -134,6 +147,8 @@ build_exe.py / build_exe.bat   # PyInstaller 실행파일 빌드
 screener/core.py           # 스크리닝 로직 (pandas, GUI 독립) — 거래량/가격/수급 조건
 screener/vault.py          # 계정 정보 암호화 금고 (초기 비밀번호 0000)
 screener/db.py             # SQLite DB (시세·수급·스크리닝 결과 저장)
+screener/performance.py    # 저장한 신호의 이후 수익률 계산
+update.py / update_windows.bat   # GitHub 에서 최신 버전 받아 업데이트
 screener/paths.py          # 사용자 데이터 폴더 (계정 금고·로그)
 screener/data/krx.py       # KRX 로그인 + 시세 패널 수집/캐시
 screener/data/dart.py      # OpenDART 공시 조회·분류

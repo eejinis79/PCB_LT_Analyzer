@@ -213,6 +213,18 @@ class StockDB:
         with self._conn() as c:
             return pd.read_sql_query(q, c, params=[asof] if asof else [])
 
+    def list_runs(self) -> pd.DataFrame:
+        with self._conn() as c:
+            return pd.read_sql_query(
+                "SELECT run_id, asof, saved_at, source, params, n_hits FROM screen_runs "
+                "ORDER BY asof DESC, run_id DESC", c)
+
+    def load_prices_since(self, start: str) -> pd.DataFrame:
+        """start(YYYYMMDD) 이후 전종목 시세 (long). 성과 계산용."""
+        with self._conn() as c:
+            return pd.read_sql_query(
+                "SELECT date, ticker, open, high, low, close FROM ohlcv WHERE date >= ?", c, params=[start])
+
     # ------------------------------------------------------------ 상태
     def stats(self) -> dict:
         with self._conn() as c:

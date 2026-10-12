@@ -20,6 +20,7 @@ from . import account
 from . import theme as T
 from .chart import ChartWidget
 from .db_dialog import DbDialog
+from .performance_view import PerformanceDialog
 from .models import COLUMNS, ResultsModel, ResultsProxy
 from .widgets import Card, ParamSlider, StatChip, hbox
 from .workers import DartWorker, LoadWorker
@@ -130,11 +131,14 @@ class MainWindow(QMainWindow):
         save = QPushButton("결과 DB 저장", objectName="Ghost")
         save.setToolTip("현재 스크리닝 결과와 조건을 DB 에 기록 (나중에 신호 이후 수익률 추적용)")
         save.clicked.connect(self.save_results)
+        perf = QPushButton("성과", objectName="Ghost")
+        perf.setToolTip("저장한 스크리닝 결과의 이후 1·5·10·20일 수익률")
+        perf.clicked.connect(lambda: PerformanceDialog(self.db_path, self).exec())
         db_btn = QPushButton("DB", objectName="Ghost")
         db_btn.setToolTip("데이터 저장 위치 · 저장된 기간 보기 / 위치 변경")
         db_btn.clicked.connect(self.open_db_dialog)
         for w in (QLabel("소스"), self.source, QLabel("기준일"), self.date_edit,
-                  self.load_btn, acct, db_btn, save, export):
+                  self.load_btn, acct, db_btn, save, perf, export):
             lay.addWidget(w)
         return h
 
