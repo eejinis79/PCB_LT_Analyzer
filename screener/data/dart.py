@@ -99,3 +99,14 @@ def classify(title: str) -> str:
     if any(k in title for k in POSITIVE_KEYWORDS):
         return "positive"
     return ""
+
+
+def summarize_flag(df: pd.DataFrame) -> str:
+    """공시 목록 → '위험: 유상증자결정' / '호재: 단일판매ㆍ공급계약체결' / ''."""
+    if df is None or df.empty:
+        return ""
+    for flag, label in (("risk", "위험"), ("positive", "호재")):
+        hit = df[df["flag"] == flag]
+        if not hit.empty:
+            return f"{label}: {hit.iloc[0]['title'][:20]}"
+    return ""

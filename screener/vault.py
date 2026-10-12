@@ -30,6 +30,8 @@ class Credentials:
     dart_id: str = ""
     dart_pw: str = ""
     dart_key: str = ""  # OpenDART API 인증키 (API 호출에는 이것만 사용)
+    telegram_token: str = ""  # 텔레그램 봇 토큰 (@BotFather 에서 발급)
+    telegram_chat: str = ""   # 받을 채팅 ID
 
     @classmethod
     def from_dict(cls, d: dict) -> "Credentials":

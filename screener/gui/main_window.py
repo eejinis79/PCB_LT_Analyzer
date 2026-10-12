@@ -23,7 +23,7 @@ from .db_dialog import DbDialog
 from .performance_view import PerformanceDialog
 from .models import COLUMNS, ResultsModel, ResultsProxy
 from .widgets import Card, ParamSlider, StatChip, hbox
-from .workers import DartWorker, LoadWorker
+from .workers import DartBatchWorker, DartWorker, LoadWorker
 
 PRESETS: dict[str, ScreenParams] = {
     "기본 · 1일 거래량 폭발 + 보합": ScreenParams(),
@@ -56,6 +56,10 @@ class MainWindow(QMainWindow):
         self._dart_client = None
         self._selected: str | None = None
         self._panel_source = ""
+        self._score_weights: dict | None = None
+        self._disc_cache: dict[str, str] = {}
+        self._disc_batch: DartBatchWorker | None = None
+        self._bt_win = None
         self.db_path = self.settings.value("db_path") or str(default_db_path())
 
         self._debounce = QTimer(self, singleShot=True, interval=150)
@@ -91,7 +95,9 @@ class MainWindow(QMainWindow):
 
     def shutdown(self):
         """백그라운드 스레드가 끝날 때까지 기다린다 (종료 시 크래시 방지)."""
-        for w in [self._loader, *self._dart_workers]:
+        if self._bt_win is not None:
+            self._bt_win.shutdown()
+        for w in [self._loader, self._disc_batch, *self._dart_workers]:
             if w is not None and w.isRunning():
                 w.wait(5000)
         self.chart.fig.clear()
@@ -131,6 +137,9 @@ class MainWindow(QMainWindow):
         save = QPushButton("결과 DB 저장", objectName="Ghost")
         save.setToolTip("현재 스크리닝 결과와 조건을 DB 에 기록 (나중에 신호 이후 수익률 추적용)")
         save.clicked.connect(self.save_results)
+        bt_btn = QPushButton("백테스트", objectName="Ghost")
+        bt_btn.setToolTip("3년치 과거 데이터로 조건 검증 · 최적화 · 요인 분석 · 모의투자")
+        bt_btn.clicked.connect(self.open_backtest)
         perf = QPushButton("성과", objectName="Ghost")
         perf.setToolTip("저장한 스크리닝 결과의 이후 1·5·10·20일 수익률")
         perf.clicked.connect(lambda: PerformanceDialog(self.db_path, self).exec())
@@ -138,7 +147,7 @@ class MainWindow(QMainWindow):
         db_btn.setToolTip("데이터 저장 위치 · 저장된 기간 보기 / 위치 변경")
         db_btn.clicked.connect(self.open_db_dialog)
         for w in (QLabel("소스"), self.source, QLabel("기준일"), self.date_edit,
-                  self.load_btn, acct, db_btn, save, perf, export):
+                  self.load_btn, acct, db_btn, save, perf, bt_btn, export):
             lay.addWidget(w)
         return h
 
@@ -227,6 +236,26 @@ class MainWindow(QMainWindow):
             fc.body.addWidget(w)
         lay.addWidget(fc)
 
+        xc = Card("⑥ 추가 필터", "백테스트로 효과를 확인한 뒤 켜는 것을 권합니다.")
+        self.pos_on = QCheckBox("바닥권만 (저점 대비 상승률 제한)")
+        self.p_pos_days = P("저점 기준 기간", 20, 250, 5, 60, "일", 0)
+        self.p_pos_max = P("저점 대비 상승률 ≤", 0, 200, 1, 30, "%", 0,
+                           "최근 N일 최저 종가 대비 현재가 상승률 — 고점권 '물량 넘기기' 회피")
+        self.obv_on = QCheckBox("매집 추세 (OBV)")
+        self.p_obv = P("OBV 추세 ≥", -1, 1, 0.05, 0.05, "", 2,
+                       "기준+최근 구간 (상승일 거래량 − 하락일 거래량) ÷ 전체 거래량. +면 매집, −면 분배")
+        self.ex_expiry = QCheckBox("옵션 만기일(매월 둘째 목요일) 신호 제외")
+        self.hide_risk = QCheckBox("DART 위험 공시 종목 숨김 (유상증자·CB·감자 등)")
+        self.hide_risk.setChecked(self.settings.value("hide_risk", "false") == "true")
+        self.learned_lbl = QLabel("", objectName="CardHint")
+        self.learned_lbl.setWordWrap(True)
+        self.learned_clear = QPushButton("기본 점수로 되돌리기", objectName="Ghost")
+        self.learned_clear.clicked.connect(lambda: self._set_weights(None))
+        for w in (self.pos_on, self.p_pos_days, self.p_pos_max, self.obv_on, self.p_obv,
+                  self.ex_expiry, self.hide_risk, self.learned_lbl, self.learned_clear):
+            xc.body.addWidget(w)
+        lay.addWidget(xc)
+
         reset = QPushButton("기본값으로 초기화", objectName="Ghost")
         reset.clicked.connect(lambda: self.set_params(ScreenParams()))
         lay.addWidget(reset)
@@ -234,8 +263,14 @@ class MainWindow(QMainWindow):
 
         for s in self._sliders():
             s.valueChanged.connect(self._schedule)
-        for c in (self.use_box, self.kospi, self.kosdaq, self.ex_pref, self.ex_spac, self.flow_on):
+        for c in (self.use_box, self.kospi, self.kosdaq, self.ex_pref, self.ex_spac, self.flow_on,
+                  self.pos_on, self.obv_on, self.ex_expiry, self.hide_risk):
             c.toggled.connect(self._schedule)
+        for chk, ws in ((self.pos_on, (self.p_pos_days, self.p_pos_max)), (self.obv_on, (self.p_obv,))):
+            for w in ws:
+                chk.toggled.connect(w.setEnabled)
+                w.setEnabled(False)
+        self._set_weights(None)
         self.base_stat.currentIndexChanged.connect(self._schedule)
         self.flow_mode.currentIndexChanged.connect(self._schedule)
         for w in (self.flow_mode, self.p_flow_days, self.p_flow_eok, self.p_flow_buy_days):
@@ -257,9 +292,11 @@ class MainWindow(QMainWindow):
         self.chip_kospi = StatChip("KOSPI", color=T.ACCENT)
         self.chip_kosdaq = StatChip("KOSDAQ", color=T.ACCENT_2)
         self.chip_asof = StatChip("기준일 · 데이터 기간", color=T.TEXT)
+        self.chip_regime = StatChip("시장 추세 (지수 vs 60일선)", color=T.TEXT)
         chips = QHBoxLayout()
         chips.setSpacing(10)
-        for c in (self.chip_total, self.chip_hits, self.chip_kospi, self.chip_kosdaq, self.chip_asof):
+        for c in (self.chip_total, self.chip_hits, self.chip_kospi, self.chip_kosdaq, self.chip_asof,
+                  self.chip_regime):
             chips.addWidget(c)
         chips.addStretch(1)
         self.search = QLineEdit(placeholderText="종목명 / 코드 검색")
@@ -317,7 +354,7 @@ class MainWindow(QMainWindow):
         return [self.p_base_days, self.p_recent_days, self.p_vol_min, self.p_vol_max, self.p_chg,
                 self.p_daily, self.p_range, self.p_box, self.p_value, self.p_price,
                 self.p_mcap_min, self.p_mcap_max, self.p_flow_days, self.p_flow_eok,
-                self.p_flow_buy_days]
+                self.p_flow_buy_days, self.p_pos_days, self.p_pos_max, self.p_obv]
 
     def params(self) -> ScreenParams:
         markets = tuple(m for m, cb in (("KOSPI", self.kospi), ("KOSDAQ", self.kosdaq)) if cb.isChecked())
@@ -334,6 +371,10 @@ class MainWindow(QMainWindow):
             flow_enabled=self.flow_on.isChecked(), flow_mode=self.flow_mode.currentData(),
             flow_days=int(self.p_flow_days.value()), flow_min_eok=self.p_flow_eok.value(),
             flow_min_buy_days=int(self.p_flow_buy_days.value()),
+            pos_enabled=self.pos_on.isChecked(), pos_days=int(self.p_pos_days.value()),
+            pos_max_pct=self.p_pos_max.value(), obv_enabled=self.obv_on.isChecked(),
+            obv_min=self.p_obv.value(), exclude_expiry=self.ex_expiry.isChecked(),
+            score_weights=self._score_weights,
         )
 
     def set_params(self, p: ScreenParams):
@@ -345,7 +386,8 @@ class MainWindow(QMainWindow):
                  (self.p_value, p.min_value_eok), (self.p_price, p.min_price),
                  (self.p_mcap_min, p.mcap_min_eok), (self.p_mcap_max, p.mcap_max_eok),
                  (self.p_flow_days, p.flow_days), (self.p_flow_eok, p.flow_min_eok),
-                 (self.p_flow_buy_days, p.flow_min_buy_days)]
+                 (self.p_flow_buy_days, p.flow_min_buy_days), (self.p_pos_days, p.pos_days),
+                 (self.p_pos_max, p.pos_max_pct), (self.p_obv, p.obv_min)]
         for w, val in pairs:
             w.setValue(val)
         self.base_stat.setCurrentIndex(max(0, self.base_stat.findData(p.base_stat)))
@@ -356,6 +398,10 @@ class MainWindow(QMainWindow):
         self.ex_spac.setChecked(p.exclude_spac)
         self.flow_on.setChecked(p.flow_enabled)
         self.flow_mode.setCurrentIndex(max(0, self.flow_mode.findData(p.flow_mode)))
+        self.pos_on.setChecked(p.pos_enabled)
+        self.obv_on.setChecked(p.obv_enabled)
+        self.ex_expiry.setChecked(p.exclude_expiry)
+        self._set_weights(p.score_weights)
         self._debounce.blockSignals(False)
         self._schedule()
 
@@ -465,6 +511,15 @@ class MainWindow(QMainWindow):
         d = panel.dates
         self.chip_total.set(f"{panel.close.shape[1]:,}")
         self.chip_asof.set(f"{d[-1]:%m/%d} · {len(d)}일")
+        try:
+            from ..backtest import current_regime
+            reg = current_regime(panel)
+            self.chip_regime.set(" · ".join(f"{m} {'▲' if ok else '▼'}" for m, ok in reg.items()))
+            self.chip_regime.value_lbl.setStyleSheet(f"color: {T.GOOD if all(reg.values()) else T.WARN};")
+            self.chip_regime.setToolTip("▲ 지수가 60일 이동평균 위 (상승 추세) · ▼ 아래 (하락 추세 — 신호 신뢰도 낮음)")
+        except Exception as e:  # noqa: BLE001
+            self.chip_regime.set("–")
+            print(f"시장 추세 계산 실패: {e}")
         self.statusBar().showMessage(
             f"{d[0]:%Y-%m-%d} ~ {d[-1]:%Y-%m-%d}, {panel.close.shape[1]:,}종목 로드 완료. "
             "왼쪽 조건을 조정하면 즉시 다시 스크리닝됩니다.")
@@ -493,7 +548,13 @@ class MainWindow(QMainWindow):
         self.flow_warn.setText("⚠ 투자자별 순매수 데이터가 없어 수급 조건을 만족하는 종목이 없습니다. "
                                "데이터를 다시 불러오세요." if no_flows else "")
         self.flow_warn.setVisible(no_flows and p.flow_enabled)
-        self.result = run_screen(self.panel, p)
+        self.settings.setValue("hide_risk", "true" if self.hide_risk.isChecked() else "false")
+        result = run_screen(self.panel, p)
+        result["disc_flag"] = result["ticker"].map(self._disc_cache).fillna("")
+        if self.hide_risk.isChecked():
+            result = result[~result["disc_flag"].str.startswith("위험")].reset_index(drop=True)
+        self.result = result
+        self._fetch_disc_flags(result["ticker"])
         self.model.set_frame(self.result)
         self.table.sortByColumn(len(COLUMNS) - 1, Qt.DescendingOrder)  # 점수 내림차순
         mk = self.result["market"].value_counts()
@@ -506,6 +567,45 @@ class MainWindow(QMainWindow):
         else:
             self.chart.show_message("조건을 만족하는 종목이 없습니다 — 조건을 완화해 보세요")
             self.disc.clear()
+
+    def _set_weights(self, w: dict | None):
+        self._score_weights = w
+        self.learned_lbl.setText("점수: 백테스트 요인 분석으로 학습한 가중치 사용 중" if w else
+                                 "점수: 기본 공식 (거래량 배수↑, 가격 변동↓)")
+        self.learned_clear.setVisible(bool(w))
+        self._schedule()
+
+    def _fetch_disc_flags(self, tickers):
+        """결과 종목의 위험/호재 공시 표시를 백그라운드로 조회 (실데이터 + DART 키 있을 때)."""
+        if (self._panel_source != "krx" or self.creds is None or not self.creds.dart_key
+                or (self._disc_batch is not None and self._disc_batch.isRunning())):
+            return
+        missing = [t for t in tickers if t not in self._disc_cache][:60]
+        if not missing:
+            return
+        if self._dart_client is None:
+            from ..data.dart import DartClient
+            self._dart_client = DartClient(self.creds.dart_key)
+        self._disc_pending = missing
+        self._disc_batch = DartBatchWorker(self._dart_client, missing)
+        self._disc_batch.progress.connect(
+            lambda k, n: self.statusBar().showMessage(f"DART 공시 확인 {k}/{n}"))
+        self._disc_batch.done.connect(self._on_disc_flags)
+        self._disc_batch.start()
+
+    def _on_disc_flags(self, flags: dict):
+        for t in self._disc_pending:  # 조회 실패 종목도 '확인함'으로 기록해 무한 재조회 방지
+            self._disc_cache[t] = flags.get(t, "")
+        self.statusBar().showMessage(f"DART 공시 확인 완료 ({len(flags)}종목)", 4000)
+        self.rescreen()
+
+    def open_backtest(self):
+        from .backtest_view import BacktestWindow
+        if self._bt_win is None:
+            self._bt_win = BacktestWindow(self)
+        self._bt_win.show()
+        self._bt_win.raise_()
+        self._bt_win.refresh_db_info()
 
     def _row_of(self, ticker: str) -> int | None:
         for r in range(self.proxy.rowCount()):
@@ -558,6 +658,8 @@ class MainWindow(QMainWindow):
         if df.empty:
             QTreeWidgetItem(self.disc, ["", "최근 90일 공시 없음"])
             return
+        from ..data.dart import summarize_flag
+        self._disc_cache[ticker] = summarize_flag(df)
         colors = {"risk": QColor(T.UP), "positive": QColor(T.GOOD)}
         for r in df.itertuples():
             it = QTreeWidgetItem(self.disc, [f"{r.date[2:4]}.{r.date[4:6]}.{r.date[6:]}", r.title])

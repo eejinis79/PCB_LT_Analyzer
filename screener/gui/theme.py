@@ -132,6 +132,13 @@ QProgressBar::chunk {{
     border-radius: 4px;
 }}
 QDialog {{ background: {BG}; }}
+QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 10px; background: {BG}; top: -1px; }}
+QTabBar::tab {{
+    background: {SURFACE_2}; color: {MUTED}; padding: 8px 18px; margin-right: 4px;
+    border: 1px solid {BORDER}; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px;
+}}
+QTabBar::tab:selected {{ background: {SURFACE}; color: {TEXT}; font-weight: 700; }}
+QTabBar::tab:hover {{ color: {TEXT}; }}
 QMenu {{ background: {SURFACE_2}; border: 1px solid {BORDER}; }}
 QMenu::item:selected {{ background: {ACCENT}; }}
 """

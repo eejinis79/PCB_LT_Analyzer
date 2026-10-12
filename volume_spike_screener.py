@@ -146,6 +146,18 @@ class ScreenParams:
     flow_min_eok: float = 0.0      # 기간 순매수금액 하한 (억원). 0 이면 '순매수(>0)'만 요구
     flow_min_buy_days: int = 1     # 기간 중 순매수한 날 수 하한
 
+    # 추가 필터
+    pos_enabled: bool = False      # 위치 필터: 최근 pos_days 저점 대비 상승률 상한 (바닥권만)
+    pos_days: int = 60
+    pos_max_pct: float = 30.0
+    obv_enabled: bool = False      # 매집(OBV) 필터: 기준+최근 구간 OBV 추세 하한
+    obv_min: float = 0.05          # -1(분배) ~ +1(매집)
+    exclude_expiry: bool = False   # 옵션 만기일(매월 둘째 목요일) 신호 제외
+
+    # 점수: None 이면 기본 공식, 백테스트 '요인 분석'에서 학습한 가중치를 넣으면 그것을 사용
+    # {특징이름: [가중치, 평균, 표준편차]}
+    score_weights: dict | None = None
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["markets"] = list(self.markets)
@@ -162,14 +174,30 @@ class ScreenParams:
     @property
     def required_days(self) -> int:
         # +1: 최근 구간 직전 종가(누적 등락률 기준점)
-        return self.base_days + self.recent_days + 1
+        need = self.base_days + self.recent_days + 1
+        if self.pos_enabled:
+            need = max(need, self.pos_days)
+        return need
 
 
 RESULT_COLUMNS = [
     "ticker", "name", "market", "close", "chg_pct", "max_daily_chg", "max_range",
     "vol_ratio", "recent_vol", "base_vol", "value_eok", "frg_eok", "inst_eok",
-    "frg_days", "inst_days", "mcap_eok", "box_pct", "score",
+    "frg_days", "inst_days", "mcap_eok", "box_pct", "pos_pct", "obv_trend", "score",
 ]
+
+# 학습 점수에 쓰는 특징 (features() 결과 컬럼으로 계산)
+LEARN_FEATURES = {
+    "log_vol_ratio": "거래량 배수(log)",
+    "abs_chg": "기간 등락률 절대값",
+    "max_range": "일중 변동폭",
+    "log_value": "거래대금(log)",
+    "log_mcap": "시가총액(log)",
+    "flow_ratio": "외국인+기관 순매수 / 거래대금",
+    "pos_pct": "저점 대비 위치",
+    "obv_trend": "OBV 매집 추세",
+    "box_pct": "기준구간 박스폭",
+}
 
 
 def is_preferred(ticker: str) -> bool:
@@ -206,12 +234,25 @@ def flow_mask(fs: pd.DataFrame, p: ScreenParams) -> pd.Series:
     }[p.flow_mode]
 
 
-def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
-    """조건에 맞는 종목을 score 내림차순으로 반환."""
-    n = len(panel.dates)
-    if n < p.recent_days + 2:
-        return pd.DataFrame(columns=RESULT_COLUMNS)
+def second_thursday(year: int, month: int) -> pd.Timestamp:
+    offset = (3 - pd.Timestamp(year=year, month=month, day=1).weekday()) % 7  # 목요일 = 3
+    return pd.Timestamp(year=year, month=month, day=1 + offset + 7)
 
+
+def is_option_expiry(day: pd.Timestamp, trading_dates) -> bool:
+    """매월 둘째 목요일(휴장이면 직전 거래일) 여부."""
+    day = pd.Timestamp(day).normalize()
+    nominal = second_thursday(day.year, day.month)
+    dates = pd.DatetimeIndex(trading_dates).normalize()
+    if nominal in dates or nominal > dates[-1]:
+        return day == nominal
+    prior = dates[(dates < nominal) & (dates.month == nominal.month)]
+    return len(prior) > 0 and day == prior[-1]
+
+
+def features(panel: Panel, p: ScreenParams) -> pd.DataFrame:
+    """기준일(패널 마지막 날) 기준 전 종목 지표. 필터는 적용하지 않는다."""
+    n = len(panel.dates)
     recent = slice(n - p.recent_days, n)
     base_start = max(0, n - p.recent_days - p.base_days)
     base = slice(base_start, n - p.recent_days)
@@ -233,27 +274,35 @@ def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
     prev_close = close.shift(1).replace(0, np.nan)
     daily_chg = ((close / prev_close - 1) * 100).iloc[recent]
     day_range = ((panel.high - panel.low) / prev_close * 100).iloc[recent]
-    max_daily_chg = daily_chg.abs().max()
-    max_range = day_range.max()
 
     base_close = close.iloc[base].replace(0, np.nan)
     box_pct = (base_close.max() - base_close.min()) / base_close.mean() * 100
 
-    value_eok = panel.value.iloc[recent].mean() / 1e8
-    # 최근 구간에 거래정지(거래량 0)일이 있으면 제외
-    halted = (vol.iloc[recent] == 0).any()
+    # 위치: 최근 pos_days 종가 최저 대비 현재 상승률(%)
+    low_close = close.iloc[-p.pos_days:].replace(0, np.nan).min()
+    pos_pct = (last_close / low_close - 1) * 100
+
+    # OBV 추세: (기준+최근 구간 OBV 변화) / 같은 구간 거래량 합 → -1 ~ +1
+    win = slice(base_start, n)
+    direction = np.sign(close.diff()).iloc[win].fillna(0)
+    v = vol.iloc[win]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        obv_trend = (direction * v).sum() / v.sum().replace(0, np.nan)
 
     df = pd.DataFrame({
         "close": last_close,
         "chg_pct": chg_pct,
-        "max_daily_chg": max_daily_chg,
-        "max_range": max_range,
+        "max_daily_chg": daily_chg.abs().max(),
+        "max_range": day_range.max(),
         "vol_ratio": vol_ratio,
         "recent_vol": recent_vol,
         "base_vol": base_vol,
-        "value_eok": value_eok,
+        "value_eok": panel.value.iloc[recent].mean() / 1e8,
         "box_pct": box_pct,
-        "halted": halted,
+        "pos_pct": pos_pct,
+        "obv_trend": obv_trend,
+        # 최근 구간에 거래정지(거래량 0)일이 있으면 제외
+        "halted": (vol.iloc[recent] == 0).any(),
     })
     df.index.name = "ticker"
 
@@ -263,11 +312,15 @@ def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
     mcap = meta.get("market_cap", pd.Series(index=df.index, dtype=float))
     df["mcap_eok"] = mcap / 1e8
     fs = flow_stats(panel, p.flow_days).reindex(df.index)
-    for c in ("frg_eok", "inst_eok", "frg_days", "inst_days"):
+    for c in fs.columns:
         df[c] = fs[c]
+    return df
 
+
+def filter_mask(df: pd.DataFrame, p: ScreenParams, expiry=False) -> pd.Series:
+    """features() 결과에 조건을 적용한 bool 마스크. expiry 는 bool 또는 행별 bool 배열."""
     m = (
-        ~df["halted"]
+        ~df["halted"].astype(bool)
         & df["market"].isin(p.markets)
         & df["vol_ratio"].between(p.vol_ratio_min, p.vol_ratio_max)
         & (df["chg_pct"].abs() <= p.price_chg_max)
@@ -288,11 +341,57 @@ def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
         m &= ~df["name"].str.contains("스팩", na=False)
     if p.flow_enabled:
         # 수급 데이터가 없는 종목/패널은 조건을 만족하지 못한 것으로 본다
-        m &= flow_mask(fs, p).fillna(False).astype(bool)
+        m &= flow_mask(df, p).fillna(False).astype(bool)
+    if p.pos_enabled:
+        m &= df["pos_pct"] <= p.pos_max_pct
+    if p.obv_enabled:
+        m &= df["obv_trend"] >= p.obv_min
+    if p.exclude_expiry:
+        ex = np.asarray(expiry, dtype=bool)
+        m &= ~(np.full(len(df), bool(ex)) if ex.ndim == 0 else ex)
+    return m.fillna(False).astype(bool)
 
-    out = df[m.fillna(False)].copy()
-    # 거래량 배수가 클수록, 가격 움직임이 작을수록 높은 점수
-    out["score"] = np.log2(out["vol_ratio"]) * 10 / (1 + out["chg_pct"].abs() + 0.5 * out["max_range"])
+
+def learn_matrix(df: pd.DataFrame, p: ScreenParams) -> pd.DataFrame:
+    """LEARN_FEATURES 값 (결측은 0 또는 중립값)."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        net = sum(pd.to_numeric(df[c], errors="coerce").fillna(0.0) if c in df else 0.0
+                  for c in ("frg_eok", "inst_eok"))
+        flow = net / (df["value_eok"] * max(1, p.flow_days)).replace(0, np.nan)
+        return pd.DataFrame({
+            "log_vol_ratio": np.log(df["vol_ratio"].clip(lower=1e-6)),
+            "abs_chg": df["chg_pct"].abs(),
+            "max_range": df["max_range"],
+            "log_value": np.log(df["value_eok"].clip(lower=1e-6)),
+            "log_mcap": np.log(df["mcap_eok"].clip(lower=1e-6)),
+            "flow_ratio": flow.fillna(0).clip(-1, 1),
+            "pos_pct": df["pos_pct"],
+            "obv_trend": df["obv_trend"],
+            "box_pct": df["box_pct"],
+        }, index=df.index)
+
+
+def score(df: pd.DataFrame, p: ScreenParams) -> pd.Series:
+    if p.score_weights:
+        X = learn_matrix(df, p)
+        s = pd.Series(0.0, index=df.index)
+        for f, (w, mu, sd) in p.score_weights.items():
+            if f in X:
+                s += w * ((X[f] - mu) / (sd or 1)).fillna(0)
+        return s * 100
+    # 기본: 거래량 배수가 클수록, 가격 움직임이 작을수록 높은 점수
+    return np.log2(df["vol_ratio"]) * 10 / (1 + df["chg_pct"].abs() + 0.5 * df["max_range"])
+
+
+def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
+    """조건에 맞는 종목을 score 내림차순으로 반환."""
+    n = len(panel.dates)
+    if n < p.recent_days + 2:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+    df = features(panel, p)
+    expiry = p.exclude_expiry and is_option_expiry(panel.dates[-1], panel.dates)
+    out = df[filter_mask(df, p, expiry)].copy()
+    out["score"] = score(out, p)
     out = out.reset_index().sort_values("score", ascending=False)
     return out[RESULT_COLUMNS].reset_index(drop=True)
 
@@ -330,6 +429,8 @@ class Credentials:
     dart_id: str = ""
     dart_pw: str = ""
     dart_key: str = ""  # OpenDART API 인증키 (API 호출에는 이것만 사용)
+    telegram_token: str = ""  # 텔레그램 봇 토큰 (@BotFather 에서 발급)
+    telegram_chat: str = ""   # 받을 채팅 ID
 
     @classmethod
     def from_dict(cls, d: dict) -> "Credentials":
@@ -484,6 +585,10 @@ CREATE TABLE IF NOT EXISTS screen_results (
     PRIMARY KEY (run_id, ticker)
 );
 CREATE INDEX IF NOT EXISTS idx_screen_results_ticker ON screen_results(ticker);
+CREATE TABLE IF NOT EXISTS index_ohlcv (
+    date TEXT NOT NULL, code TEXT NOT NULL, close REAL,
+    PRIMARY KEY (date, code)
+);
 """
 
 OHLCV_FIELDS = ["open", "high", "low", "close", "volume", "value"]
@@ -615,7 +720,10 @@ class StockDB:
         main_cols = ["close", "chg_pct", "vol_ratio", "value_eok", "frg_eok", "inst_eok", "score"]
 
         def num(v):
-            return None if pd.isna(v) else float(v)
+            try:
+                return None if pd.isna(v) else float(v)
+            except (TypeError, ValueError):
+                return None
 
         with self._conn() as c:
             c.execute("DELETE FROM screen_runs WHERE asof=? AND params=? AND source=?", (asof, pj, source))
@@ -637,6 +745,60 @@ class StockDB:
              + (" WHERE r.asof=?" if asof else "") + " ORDER BY r.asof DESC, s.run_id DESC, s.rank")
         with self._conn() as c:
             return pd.read_sql_query(q, c, params=[asof] if asof else [])
+
+    # ------------------------------------------------------------ 기간 조회 (백테스트용)
+    def trade_dates(self, start: str | None = None, end: str | None = None) -> list[str]:
+        with self._conn() as c:
+            rows = c.execute("SELECT DISTINCT date FROM ohlcv WHERE date >= ? AND date <= ? ORDER BY date",
+                             (start or "00000000", end or "99999999")).fetchall()
+        return [r[0] for r in rows]
+
+    def load_ohlcv_range(self, start: str, end: str, markets) -> pd.DataFrame:
+        q = (f"SELECT * FROM ohlcv WHERE date >= ? AND date <= ? "
+             f"AND market IN ({','.join('?' * len(markets))})")
+        with self._conn() as c:
+            return pd.read_sql_query(q, c, params=[start, end, *markets])
+
+    def load_flows_range(self, start: str, end: str, investor: str) -> pd.DataFrame:
+        with self._conn() as c:
+            df = pd.read_sql_query(
+                "SELECT date, ticker, net_value FROM flows WHERE investor=? AND date >= ? AND date <= ?",
+                c, params=[investor, start, end])
+        if df.empty:
+            return pd.DataFrame()
+        wide = df.pivot(index="date", columns="ticker", values="net_value")
+        wide.index = pd.to_datetime(wide.index)
+        return wide.sort_index()
+
+    def latest_shares(self) -> pd.Series:
+        """종목별 가장 최근 상장주식수 (과거 시가총액 근사용)."""
+        with self._conn() as c:
+            df = pd.read_sql_query(
+                "SELECT m.ticker, m.shares FROM market_cap m JOIN "
+                "(SELECT ticker, MAX(date) d FROM market_cap GROUP BY ticker) x "
+                "ON m.ticker = x.ticker AND m.date = x.d", c)
+        return df.set_index("ticker")["shares"]
+
+    def ticker_markets(self) -> pd.Series:
+        with self._conn() as c:
+            df = pd.read_sql_query(
+                "SELECT ticker, market FROM ohlcv WHERE date = (SELECT MAX(date) FROM ohlcv) "
+                "UNION SELECT ticker, market FROM tickers WHERE market IS NOT NULL", c)
+        return df.drop_duplicates("ticker").set_index("ticker")["market"]
+
+    def save_index(self, code: str, s: pd.Series):
+        """s: index=YYYYMMDD, 값=종가."""
+        rows = [(d, code, float(v)) for d, v in s.items() if pd.notna(v)]
+        with self._conn() as c:
+            c.executemany("INSERT OR REPLACE INTO index_ohlcv VALUES (?,?,?)", rows)
+
+    def load_index(self, code: str) -> pd.Series:
+        with self._conn() as c:
+            df = pd.read_sql_query("SELECT date, close FROM index_ohlcv WHERE code=? ORDER BY date",
+                                   c, params=[code])
+        s = df.set_index("date")["close"]
+        s.index = pd.to_datetime(s.index)
+        return s
 
     def list_runs(self) -> pd.DataFrame:
         with self._conn() as c:
@@ -911,6 +1073,7 @@ import pandas as pd
 # 예전 버전의 .pkl 캐시 위치 (DB 로 이전할 때만 사용)
 LEGACY_CACHE_DIR = cache_dir("krx")
 FINAL_HOUR = 18  # 이 시각 이후의 당일 데이터는 확정으로 보고 DB 에 고정
+INDEX_CODES = {"KOSPI": "1001", "KOSDAQ": "2001"}
 # pykrx 투자자 구분 이름
 INVESTOR_NAMES = {"foreign": "외국인", "inst": "기관합계"}
 OHLCV_COLS = {"시가": "open", "고가": "high", "저가": "low", "종가": "close",
@@ -1035,9 +1198,15 @@ def krx_load_panel(end: dt.date, days: int, markets=("KOSPI", "KOSDAQ"),
         db.save_names(new, market_of.to_dict())
         names.update(new)
     meta["name"] = [names.get(t, "") for t in meta.index]
+    try:  # 시장 국면(지수 vs 이동평균) 판단용 지수 — 2회 호출
+        fetch_index(db, (end - dt.timedelta(days=150)).strftime("%Y%m%d"), trade_dates[-1])
+    except Exception as e:  # noqa: BLE001
+        print(f"지수 수집 실패 (전종목 평균으로 대체): {e}")
     progress(total, total, f"완료 — KRX 신규 조회 {fetched}일분, 나머지는 DB 사용")
     # 상장 전/거래정지 등 결측은 NaN 으로 둔다 (0 으로 채우면 평소 거래량이 왜곡됨)
-    return Panel(**wide, meta=meta, flows=flows)
+    panel = Panel(**wide, meta=meta, flows=flows)
+    panel.index_close = {m: db.load_index(c) for m, c in INDEX_CODES.items()}
+    return panel
 
 
 def _load_flows(db: StockDB, dates, markets, progress, step, total, sleep):
@@ -1072,6 +1241,93 @@ def _safe_name(stock, ticker: str) -> str:
         return stock.get_market_ticker_name(ticker)
     except Exception:
         return ""
+
+
+BACKFILL_DAYS_PER_YEAR = 248
+
+
+def fetch_index(db: StockDB, start: str, end: str) -> int:
+    """KOSPI/KOSDAQ 지수 종가를 DB 에 저장 (시장 국면 필터용). 저장한 일수 반환."""
+    from pykrx import stock
+
+    n = 0
+    for code in INDEX_CODES.values():
+        df = stock.get_index_ohlcv_by_date(start, end, code, name_display=False)
+        if df is None or df.empty:
+            continue
+        s = df["종가"]
+        s.index = [pd.Timestamp(d).strftime("%Y%m%d") for d in s.index]
+        db.save_index(code, s)
+        n = max(n, len(s))
+    return n
+
+
+def krx_backfill(db: StockDB, years: int = 3, end: dt.date | None = None, markets=("KOSPI", "KOSDAQ"),
+             with_flows: bool = True, progress: Progress | None = None,
+             cancelled=lambda: False, sleep: float = 0.3) -> dict:
+    """과거 years 년치 전종목 시세(상장폐지 종목 포함)를 DB 에 채운다.
+
+    이미 받은 날짜는 건너뛰므로 중간에 멈춰도 다시 실행하면 이어서 받는다.
+    날짜 하나가 실패해도 전체를 멈추지 않고 건너뛴 뒤 개수를 보고한다.
+    """
+    from pykrx import stock
+
+    progress = progress or (lambda *_: None)
+    end = end or dt.date.today()
+    progress(0, 1, "영업일 목록 조회…")
+    dates = _business_days(end, years * BACKFILL_DAYS_PER_YEAR)
+    kinds = ["ohlcv"] + ([f"flow_{k}" for k in INVESTOR_NAMES] if with_flows else [])
+    todo = [(d, m, k) for d in dates for m in markets for k in kinds if not db.fetched(d, m, k)]
+    total = len(todo) + 2
+    stats = {"days": len(dates), "fetched": 0, "skipped": len(dates) * len(markets) * len(kinds) - len(todo),
+             "errors": 0, "cancelled": False}
+    for step, (date, market, kind) in enumerate(todo, 1):
+        if cancelled():
+            stats["cancelled"] = True
+            break
+        progress(step, total, f"{date} {market} {'시세' if kind == 'ohlcv' else INVESTOR_NAMES[kind[5:]] + ' 순매수'}"
+                              f"  ({step}/{len(todo)}, 오류 {stats['errors']})")
+        for attempt in (1, 2):
+            try:
+                if kind == "ohlcv":
+                    _fetch_day(db, date, market)
+                else:
+                    inv = kind[5:]
+                    df = stock.get_market_net_purchases_of_equities_by_ticker(
+                        date, date, market=market, investor=INVESTOR_NAMES[inv])
+                    s = (df["순매수거래대금"].astype(float) if df is not None and not df.empty
+                         else pd.Series(dtype=float))
+                    db.save_flow(date, market, inv, s, final=is_final(date))
+                stats["fetched"] += 1
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 2:
+                    stats["errors"] += 1
+                    print(f"백필 실패 {date} {market} {kind}: {e}")
+                else:
+                    time.sleep(2)
+        time.sleep(sleep)
+
+    if not stats["cancelled"] and dates:
+        progress(total - 1, total, "지수 · 상장주식수 · 종목명")
+        try:
+            fetch_index(db, dates[0], dates[-1])
+        except Exception as e:  # noqa: BLE001
+            print(f"지수 수집 실패 (시장 국면은 전종목 평균으로 대체): {e}")
+        last = db.trade_dates()[-1:] or [dates[-1]]
+        if db.load_caps(last[0]).empty:
+            try:
+                raw = pd.concat([stock.get_market_cap_by_ticker(last[0], market=m) for m in markets])
+                db.save_caps(last[0], pd.DataFrame({"market_cap": raw["시가총액"], "shares": raw["상장주식수"]}))
+            except Exception as e:  # noqa: BLE001
+                print(f"시가총액 수집 실패: {e}")
+        names = db.load_names()
+        markets_of = db.ticker_markets()
+        missing = [t for t in markets_of.index if t not in names]
+        if missing:
+            db.save_names({t: _safe_name(stock, t) for t in missing}, markets_of.to_dict())
+    progress(total, total, "완료")
+    return stats
 
 
 # ============================================================================
@@ -1176,6 +1432,475 @@ def classify(title: str) -> str:
     if any(k in title for k in POSITIVE_KEYWORDS):
         return "positive"
     return ""
+
+
+def summarize_flag(df: pd.DataFrame) -> str:
+    """공시 목록 → '위험: 유상증자결정' / '호재: 단일판매ㆍ공급계약체결' / ''."""
+    if df is None or df.empty:
+        return ""
+    for flag, label in (("risk", "위험"), ("positive", "호재")):
+        hit = df[df["flag"] == flag]
+        if not hit.empty:
+            return f"{label}: {hit.iloc[0]['title'][:20]}"
+    return ""
+
+
+# ============================================================================
+# screener/backtest.py
+# ============================================================================
+"""과거 데이터 백테스트 · 조건 최적화(워크포워드) · 요인 분석 · 모의투자.
+
+흐름
+  1. load_history(db)               DB 에 쌓인 과거 시세로 전체 기간 Panel 구성
+  2. build_candidates(panel, p)     날짜마다 '느슨한' 조건으로 후보를 뽑고 지표 + 이후 수익률 기록
+                                    (실제 조건은 select() 로 다시 거른다 → 최적화가 빠름)
+  3. select(cands, p)               현재 조건을 적용한 신호
+  4. simulate(signals, panel, rules) 포트폴리오 매매 시뮬레이션 (손절·익절·보유기간·비용·동시보유)
+  5. grid_search / factor_analysis  조건 조합 비교(학습/검증 기간 분리), 지표별 수익 관련성 · 학습 점수
+
+미래 데이터 사용 금지: 신호는 t 일 종가까지의 정보로 만들고, 진입은 t+1 일 시가.
+"""
+
+from dataclasses import asdict, dataclass, replace
+
+import numpy as np
+import pandas as pd
+
+
+FWD_HORIZONS = (5, 10, 20)  # 후보별 이후 수익률을 기록하는 보유 기간
+GRID_VOL = (2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 10.0)
+GRID_CHG = (1.0, 2.0, 3.0, 4.0, 5.0)
+
+
+@dataclass
+class TradeRules:
+    stop_pct: float = 5.0        # 손절 (진입가 대비 %, 0 = 사용 안 함)
+    target_pct: float = 15.0     # 익절 (%, 0 = 사용 안 함)
+    max_hold: int = 20           # 최대 보유 영업일
+    cost_pct: float = 0.25       # 왕복 비용 % (수수료 + 매도세 + 슬리피지)
+    max_positions: int = 5       # 동시 보유 종목 수 (자금을 균등 배분)
+    per_day: int = 2             # 하루 신규 진입 최대 수 (점수 상위부터)
+    regime_filter: bool = True   # 해당 시장 지수가 이동평균 아래면 신규 진입 안 함
+    regime_ma: int = 60
+
+    def to_dict(self):
+        return asdict(self)
+
+
+# ---------------------------------------------------------------------------- 데이터
+def load_history(db, start: str | None = None, end: str | None = None,
+                 markets=("KOSPI", "KOSDAQ")) -> Panel:
+    """DB 의 기간 시세로 Panel 구성. 시가총액은 최신 상장주식수 × 당일 종가로 근사한다."""
+    dates = db.trade_dates(start, end)
+    if not dates:
+        raise ValueError("DB 에 시세가 없습니다. 먼저 '과거 데이터 수집'을 실행하세요.")
+    long = db.load_ohlcv_range(dates[0], dates[-1], markets)
+    long["date"] = pd.to_datetime(long["date"])
+    wide = {f: long.pivot(index="date", columns="ticker", values=f).sort_index() for f in FIELDS}
+    tickers = wide["close"].columns
+    meta = pd.DataFrame(index=tickers)
+    meta["market"] = long.drop_duplicates("ticker", keep="last").set_index("ticker")["market"]
+    names = db.load_names()
+    meta["name"] = [names.get(t, "") for t in tickers]
+    meta["shares"] = db.latest_shares().reindex(tickers)
+    meta["market_cap"] = meta["shares"] * wide["close"].ffill().iloc[-1]
+    flows = {}
+    for inv in INVESTORS:
+        f = db.load_flows_range(dates[0], dates[-1], inv)
+        if not f.empty:
+            flows[inv] = f.reindex(columns=tickers).fillna(0)
+    panel = Panel(**wide, meta=meta, flows=flows if len(flows) == len(INVESTORS) else {})
+    panel.index_close = {m: db.load_index(c) for m, c in INDEX_CODES.items()}
+    return panel
+
+
+def regime_table(panel: Panel, ma: int = 60) -> pd.DataFrame:
+    """날짜 x 시장 → 지수가 ma 일 이동평균 위인지. 지수가 없으면 전종목 동일가중 지수로 대체."""
+    out = {}
+    idx = getattr(panel, "index_close", {}) or {}
+    rets = panel.close.pct_change(fill_method=None).clip(-0.3, 0.3)
+    for market in ("KOSPI", "KOSDAQ"):
+        s = idx.get(market)
+        if s is None or s.empty:
+            cols = panel.meta.index[panel.meta["market"] == market]
+            s = (1 + rets[cols].mean(axis=1).fillna(0)).cumprod()
+        s = s.reindex(panel.dates).ffill()
+        out[market] = (s >= s.rolling(ma, min_periods=max(5, ma // 2)).mean()).fillna(True)
+    return pd.DataFrame(out)
+
+
+def current_regime(panel: Panel, ma: int = 60) -> dict:
+    """기준일(패널 마지막 날) 시장별 추세 양호 여부. {'KOSPI': True, 'KOSDAQ': False}"""
+    return {m: bool(v) for m, v in regime_table(panel, ma).iloc[-1].items()}
+
+
+def loose_params(p: ScreenParams) -> ScreenParams:
+    """후보 풀을 만들 때 쓰는 느슨한 조건 (최적화 격자 범위 + 추가 필터 해제)."""
+    return replace(
+        p,
+        vol_ratio_min=min(p.vol_ratio_min, GRID_VOL[0]),
+        price_chg_max=max(p.price_chg_max, GRID_CHG[-1]),
+        daily_chg_max=max(p.daily_chg_max, GRID_CHG[-1]),
+        range_max=max(p.range_max, 15.0),
+        flow_enabled=False, pos_enabled=False, obv_enabled=False, exclude_expiry=False,
+    )
+
+
+def build_candidates(panel: Panel, p: ScreenParams, start: str | None = None,
+                     progress=None, cancelled=lambda: False, cost_pct: float = 0.25) -> pd.DataFrame:
+    """날짜마다 느슨한 조건의 후보 + 지표 + 다음날 시가 진입 기준 이후 수익률(비용 차감)."""
+    progress = progress or (lambda *_: None)
+    loose = loose_params(p)
+    window = max(loose.required_days, p.required_days, p.pos_days if p.pos_enabled else 0, loose.pos_days) + 1
+    dates = panel.dates
+    first = max(window, int(np.searchsorted(dates, pd.Timestamp(start))) if start else 0)
+    shares = panel.meta.get("shares")
+    close_ff = panel.close.ffill()
+    parts = []
+    total = len(dates) - first
+    for k, i in enumerate(range(first, len(dates))):
+        if cancelled():
+            break
+        if k % 10 == 0:
+            progress(k, total, f"후보 계산 {dates[i]:%Y-%m-%d} ({k}/{total})")
+        sl = slice(i - window + 1, i + 1)
+        meta = panel.meta.copy()
+        if shares is not None:
+            meta["market_cap"] = shares * close_ff.iloc[i]
+        flows = {}
+        if panel.has_flows:
+            flows = {kk: v.loc[:dates[i]].iloc[-FLOW_DAYS:] for kk, v in panel.flows.items()}
+        sub = Panel(**{f: getattr(panel, f).iloc[sl] for f in FIELDS}, meta=meta, flows=flows)
+        df = features(sub, loose)
+        df = df[filter_mask(df, loose)]
+        if df.empty:
+            continue
+        df = df.assign(di=i, date=dates[i], expiry=is_option_expiry(dates[i], dates[:i + 1]))
+        parts.append(df.reset_index())
+    progress(total, total, "이후 수익률 계산")
+    if not parts:
+        return pd.DataFrame()
+    cands = pd.concat(parts, ignore_index=True)
+    return add_forward_returns(cands, panel, cost_pct)
+
+
+def add_forward_returns(cands: pd.DataFrame, panel: Panel, cost_pct: float) -> pd.DataFrame:
+    col = {t: j for j, t in enumerate(panel.close.columns)}
+    O, C = panel.open.to_numpy(float), panel.close.to_numpy(float)
+    O[O == 0] = np.nan
+    C[C == 0] = np.nan
+    n = len(panel.dates)
+    ci = cands["ticker"].map(col).to_numpy()
+    di = cands["di"].to_numpy()
+    entry = np.where(di + 1 < n, O[np.minimum(di + 1, n - 1), ci], np.nan)
+    cands["entry"] = entry
+    for h in FWD_HORIZONS:
+        j = di + h
+        px = np.where(j < n, C[np.minimum(j, n - 1), ci], np.nan)
+        cands[f"fwd{h}"] = px / entry - 1 - cost_pct / 100
+    return cands
+
+
+def select(cands: pd.DataFrame, p: ScreenParams) -> pd.DataFrame:
+    """후보 풀에 실제 조건을 적용하고 날짜별 점수 순으로 정렬."""
+    if cands.empty:
+        return cands
+    c = cands.set_index("ticker")
+    out = c[filter_mask(c, p, c["expiry"].to_numpy())].copy()
+    out["score"] = score(out, p)
+    return out.reset_index().sort_values(["di", "score"], ascending=[True, False])
+
+
+# ---------------------------------------------------------------------------- 매매 시뮬레이션
+def simulate(signals: pd.DataFrame, panel: Panel, rules: TradeRules,
+             start_di: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """signals: di(신호일 위치), ticker, score[, name]. 진입은 신호 다음날 시가.
+
+    반환 (trades, equity, metrics). equity: date, equity, bench(전종목 평균), exposure
+    """
+    dates = panel.dates
+    n = len(dates)
+    col = {t: j for j, t in enumerate(panel.close.columns)}
+    O, H, L, C = (getattr(panel, f).to_numpy(float) for f in ("open", "high", "low", "close"))
+    for a in (O, H, L, C):
+        a[a == 0] = np.nan
+    names = panel.meta.get("name", pd.Series(dtype=object))
+    markets = panel.meta.get("market", pd.Series(dtype=object))
+    regime = regime_table(panel, rules.regime_ma) if rules.regime_filter else None
+
+    by_day = {d: g for d, g in signals.groupby("di")} if not signals.empty else {}
+    i0 = start_di if start_di is not None else (int(signals["di"].min()) + 1 if by_day else n)
+    cash, positions, trades, curve = 1.0, {}, [], []
+    last_px = {}
+
+    def close_pos(t, i, px, reason):
+        nonlocal cash
+        pos = positions.pop(t)
+        proceeds = pos["shares"] * px * (1 - rules.cost_pct / 100)
+        cash += proceeds
+        trades.append({
+            "ticker": t, "name": names.get(t, ""), "market": markets.get(t, ""),
+            "signal_date": dates[pos["e"] - 1], "entry_date": dates[pos["e"]], "entry": pos["px"],
+            "exit_date": dates[i], "exit": px, "reason": reason,
+            "ret": px / pos["px"] * (1 - rules.cost_pct / 100) - 1, "days": i - pos["e"] + 1,
+            "score": pos["score"],
+        })
+
+    equity_prev = 1.0
+    for i in range(max(i0, 1), n):
+        # 1) 보유 종목 청산 점검 (진입 당일 포함)
+        for t in list(positions):
+            pos, c = positions[t], col[t]
+            o, h, lo, cl = O[i, c], H[i, c], L[i, c], C[i, c]
+            if np.isnan(cl):  # 거래정지/상장폐지 — 마지막 가격으로 평가만
+                if i - pos["e"] + 1 >= rules.max_hold * 3:  # 장기 정지면 마지막 가격으로 정리
+                    close_pos(t, i, last_px.get(t, pos["px"]), "거래정지")
+                continue
+            last_px[t] = cl
+            stop = pos["px"] * (1 - rules.stop_pct / 100) if rules.stop_pct > 0 else None
+            tgt = pos["px"] * (1 + rules.target_pct / 100) if rules.target_pct > 0 else None
+            if stop is not None and lo <= stop:
+                close_pos(t, i, o if o < stop else stop, "손절")
+            elif tgt is not None and h >= tgt:
+                close_pos(t, i, o if o > tgt else tgt, "익절")
+            elif i - pos["e"] + 1 >= rules.max_hold:
+                close_pos(t, i, cl, "기간만료")
+
+        # 2) 전날 신호로 오늘 시가 진입
+        sig = by_day.get(i - 1)
+        if sig is not None and len(positions) < rules.max_positions:
+            entered = 0
+            for r in sig.itertuples():
+                if len(positions) >= rules.max_positions or entered >= rules.per_day:
+                    break
+                t = r.ticker
+                if t in positions or t not in col:
+                    continue
+                if regime is not None and not regime.iloc[i - 1].get(markets.get(t, "KOSPI"), True):
+                    continue
+                px = O[i, col[t]]
+                if np.isnan(px):
+                    continue
+                alloc = min(cash, equity_prev / rules.max_positions)
+                if alloc <= 1e-9:
+                    break
+                cash -= alloc
+                positions[t] = {"shares": alloc / px, "px": px, "e": i, "score": r.score}
+                entered += 1
+                # 진입 당일 손절/익절 점검
+                c = col[t]
+                stop = px * (1 - rules.stop_pct / 100) if rules.stop_pct > 0 else None
+                if stop is not None and L[i, c] <= stop:
+                    close_pos(t, i, stop, "손절")
+
+        value = sum(p["shares"] * (C[i, col[t]] if not np.isnan(C[i, col[t]]) else last_px.get(t, p["px"]))
+                    for t, p in positions.items())
+        equity_prev = cash + value
+        curve.append({"date": dates[i], "equity": equity_prev, "exposure": value / equity_prev if equity_prev else 0,
+                      "positions": len(positions)})
+
+    for t in list(positions):  # 기간 끝: 마지막 가격으로 평가 청산
+        close_pos(t, n - 1, last_px.get(t, positions[t]["px"]), "보유중")
+
+    equity = pd.DataFrame(curve)
+    if not equity.empty:
+        rets = panel.close.pct_change(fill_method=None).clip(-0.3, 0.3).mean(axis=1).fillna(0)
+        # 시장 = 전종목 동일가중 일간 수익률 누적 (equity 와 같은 날부터)
+        equity["bench"] = (1 + rets.loc[equity["date"]]).cumprod().to_numpy()
+    trades = pd.DataFrame(trades)
+    return trades, equity, metrics(trades, equity)
+
+
+def metrics(trades: pd.DataFrame, equity: pd.DataFrame) -> dict:
+    if equity.empty:
+        return {"trades": 0}
+    eq = equity["equity"]
+    years = max((equity["date"].iloc[-1] - equity["date"].iloc[0]).days / 365.25, 1e-9)
+    mdd = (eq / eq.cummax() - 1).min()
+    bench = equity["bench"]
+    out = {
+        "trades": len(trades),
+        "total": eq.iloc[-1] - 1,
+        "cagr": eq.iloc[-1] ** (1 / years) - 1 if eq.iloc[-1] > 0 else -1,
+        "mdd": mdd,
+        "bench_total": bench.iloc[-1] - 1,
+        "exposure": equity["exposure"].mean(),
+        "start": equity["date"].iloc[0], "end": equity["date"].iloc[-1],
+    }
+    if len(trades):
+        r = trades["ret"]
+        out.update({
+            "win_rate": (r > 0).mean(), "avg_ret": r.mean(),
+            "avg_win": r[r > 0].mean() if (r > 0).any() else 0.0,
+            "avg_loss": r[r <= 0].mean() if (r <= 0).any() else 0.0,
+            "avg_days": trades["days"].mean(),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------- 최적화 · 요인 분석
+def split_date(cands: pd.DataFrame, train_frac: float = 0.67) -> pd.Timestamp:
+    d = np.sort(cands["date"].unique())
+    return pd.Timestamp(d[min(len(d) - 1, int(len(d) * train_frac))])
+
+
+def _stats(r: pd.Series) -> dict:
+    r = r.dropna()
+    return {"n": len(r), "mean": r.mean() if len(r) else np.nan,
+            "win": (r > 0).mean() if len(r) else np.nan}
+
+
+def grid_search(cands: pd.DataFrame, p: ScreenParams, horizon: int = 10, train_frac: float = 0.67,
+                vol_grid=GRID_VOL, chg_grid=GRID_CHG, top_per_day: int = 0) -> pd.DataFrame:
+    """거래량 배수 x 허용 등락률 조합별 학습/검증 기간 성과 (신호 단위 평균 수익, 비용 차감).
+
+    top_per_day > 0 이면 날짜별 점수 상위 N 개만 (실제 매매처럼).
+    """
+    cut = split_date(cands, train_frac)
+    rows = []
+    for v in vol_grid:
+        for c in chg_grid:
+            q = replace(p, vol_ratio_min=v, price_chg_max=c, daily_chg_max=max(p.daily_chg_max, c))
+            sel = select(cands, q)
+            if top_per_day:
+                sel = sel.groupby("di", group_keys=False).head(top_per_day)
+            r = sel[f"fwd{horizon}"]
+            tr, te = _stats(r[sel["date"] < cut]), _stats(r[sel["date"] >= cut])
+            rows.append({"vol_ratio_min": v, "price_chg_max": c,
+                         **{f"train_{k}": x for k, x in tr.items()}, **{f"test_{k}": x for k, x in te.items()}})
+    out = pd.DataFrame(rows)
+    out.attrs["split"] = cut
+    return out
+
+
+def best_cell(grid: pd.DataFrame, min_n: int = 30) -> pd.Series | None:
+    ok = grid[grid["train_n"] >= min_n]
+    if ok.empty:
+        return None
+    return ok.sort_values("train_mean", ascending=False).iloc[0]
+
+
+def factor_analysis(cands: pd.DataFrame, p: ScreenParams, horizon: int = 10, train_frac: float = 0.67,
+                    ridge: float = 10.0, top_k: int = 3) -> dict:
+    """지표별 이후 수익률과의 관련성(날짜별 순위상관 평균, IC)과 학습 점수 가중치.
+
+    학습 기간으로 가중치를 정하고, 검증 기간에서 '학습 점수 상위 top_k' vs '기본 점수 상위 top_k' 를 비교.
+    """
+    y_col = f"fwd{horizon}"
+    data = cands.dropna(subset=[y_col]).copy()
+    if len(data) < 50:
+        return {"error": "표본이 부족합니다 (최소 50개 신호 필요). 과거 데이터를 더 수집하세요."}
+    data = data.set_index("ticker", drop=False)
+    X = learn_matrix(data, p).reset_index(drop=True)
+    y = data[y_col].clip(*data[y_col].quantile([0.01, 0.99])).reset_index(drop=True)
+    dates = data["date"].reset_index(drop=True)
+    cut = split_date(data.reset_index(drop=True), train_frac)
+    train = dates < cut
+
+    ic = {}
+    for f in X.columns:
+        per_day = []
+        for _, g in pd.DataFrame({"x": X[f], "y": y, "d": dates})[train].groupby("d"):
+            if len(g) >= 5 and g["x"].nunique() > 1:
+                per_day.append(g["x"].rank().corr(g["y"].rank()))
+        ic[f] = (np.nanmean(per_day) if per_day else np.nan, len(per_day))
+
+    Xt = X[train].fillna(0)
+    mu, sd = Xt.mean(), Xt.std().replace(0, 1)
+    Z = ((Xt - mu) / sd).to_numpy()
+    yt = y[train].to_numpy()
+    w = np.linalg.solve(Z.T @ Z + ridge * np.eye(Z.shape[1]), Z.T @ (yt - yt.mean()))
+    weights = {f: [float(w[k]), float(mu[f]), float(sd[f])] for k, f in enumerate(X.columns)}
+
+    test = data.reset_index(drop=True)[~train].copy()
+    if test.empty:
+        comp = {}
+    else:
+        qp = replace(p, score_weights=weights)
+        test["learned"] = score(test.set_index("ticker"), qp).to_numpy()
+        test["base"] = score(test.set_index("ticker"), replace(p, score_weights=None)).to_numpy()
+        top = lambda col: test.sort_values(col, ascending=False).groupby("di").head(top_k)[y_col]  # noqa: E731
+        comp = {"all": _stats(test[y_col]), "base_top": _stats(top("base")), "learned_top": _stats(top("learned"))}
+
+    table = pd.DataFrame([
+        {"feature": f, "label": LEARN_FEATURES[f], "ic": ic[f][0], "days": ic[f][1], "weight": weights[f][0]}
+        for f in X.columns
+    ]).sort_values("ic", key=lambda s: s.abs(), ascending=False)
+    return {"table": table, "weights": weights, "test": comp, "split": cut, "horizon": horizon, "n": len(data)}
+
+
+# ---------------------------------------------------------------------------- 모의투자 (저장된 실제 신호)
+def saved_signals(db, panel: Panel, source_filter=("krx", "auto")) -> pd.DataFrame:
+    """DB 에 저장된 스크리닝 결과를 시뮬레이션 신호 형식으로 (같은 날 같은 종목은 1번)."""
+    res = db.load_results()
+    if res.empty:
+        return pd.DataFrame(columns=["di", "ticker", "score"])
+    runs = db.list_runs().set_index("run_id")
+    res = res[res["run_id"].map(runs["source"]).isin(source_filter)]
+    pos = {d.strftime("%Y%m%d"): i for i, d in enumerate(panel.dates)}
+    res = res.assign(di=res["asof"].map(pos)).dropna(subset=["di"])
+    res["di"] = res["di"].astype(int)
+    res = res.sort_values(["di", "run_id", "rank"]).drop_duplicates(["di", "ticker"])
+    return res[["di", "ticker", "score", "name"]].sort_values(["di", "score"], ascending=[True, False])
+
+
+# ============================================================================
+# screener/notify.py
+# ============================================================================
+"""알림: 텔레그램 봇으로 메시지 보내기.
+
+설정: 텔레그램에서 @BotFather → /newbot → 봇 토큰 발급.
+      만든 봇에게 아무 메시지나 보낸 뒤 '채팅 ID 찾기'(find_chat_id)로 채팅 ID 확인.
+"""
+
+import pandas as pd
+import requests
+
+API = "https://api.telegram.org/bot{token}/{method}"
+
+
+class NotifyError(RuntimeError):
+    pass
+
+
+def send_telegram(token: str, chat_id: str, text: str, timeout: float = 15) -> None:
+    if not (token and chat_id):
+        raise NotifyError("텔레그램 봇 토큰과 채팅 ID 를 '계정'에 입력하세요.")
+    for chunk in [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]:
+        r = requests.post(API.format(token=token, method="sendMessage"),
+                          data={"chat_id": chat_id, "text": chunk}, timeout=timeout)
+        if r.status_code != 200 or not r.json().get("ok"):
+            raise NotifyError(f"텔레그램 전송 실패: {r.text[:200]}")
+
+
+def find_chat_id(token: str, timeout: float = 15) -> str | None:
+    """봇에게 최근 메시지를 보낸 채팅의 ID."""
+    r = requests.get(API.format(token=token, method="getUpdates"), timeout=timeout)
+    data = r.json()
+    if not data.get("ok"):
+        raise NotifyError(f"봇 토큰을 확인하세요: {data.get('description')}")
+    for upd in reversed(data.get("result", [])):
+        msg = upd.get("message") or upd.get("channel_post") or {}
+        if "chat" in msg:
+            return str(msg["chat"]["id"])
+    return None
+
+
+def format_results(asof: str, result: pd.DataFrame, regime: dict | None = None, top: int = 15) -> str:
+    d = f"{asof[:4]}-{asof[4:6]}-{asof[6:]}"
+    lines = [f"📊 거래량 급증·횡보 스크리닝 {d}", f"조건 충족 {len(result)}종목"]
+    if regime:
+        weak = [m for m, ok in regime.items() if not ok]
+        lines.append("⚠ 하락 추세 시장: " + ", ".join(weak) if weak else "시장 추세: 양호")
+    lines.append("")
+    for i, r in enumerate(result.head(top).itertuples(), 1):
+        flow = ""
+        if pd.notna(getattr(r, "frg_eok", float("nan"))):
+            flow = f" 외{r.frg_eok:+.0f}억 기{r.inst_eok:+.0f}억"
+        lines.append(f"{i}. {r.name}({r.ticker}) {r.close:,.0f}원 {r.chg_pct:+.1f}% 거래량{r.vol_ratio:.1f}배{flow}")
+    if len(result) > top:
+        lines.append(f"… 외 {len(result) - top}종목")
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -1315,6 +2040,13 @@ QProgressBar::chunk {{
     border-radius: 4px;
 }}
 QDialog {{ background: {BG}; }}
+QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 10px; background: {BG}; top: -1px; }}
+QTabBar::tab {{
+    background: {SURFACE_2}; color: {MUTED}; padding: 8px 18px; margin-right: 4px;
+    border: 1px solid {BORDER}; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px;
+}}
+QTabBar::tab:selected {{ background: {SURFACE}; color: {TEXT}; font-weight: 700; }}
+QTabBar::tab:hover {{ color: {TEXT}; }}
 QMenu {{ background: {SURFACE_2}; border: 1px solid {BORDER}; }}
 QMenu::item:selected {{ background: {ACCENT}; }}
 """
@@ -1581,11 +2313,12 @@ COLUMNS = [
     ("recent_vol", "최근거래량", "{:,.0f}", ""),
     ("base_vol", "평소거래량", "{:,.0f}", ""),
     ("value_eok", "거래대금(억)", "{:,.1f}", "최근 구간 평균 거래대금"),
+    ("disc_flag", "공시", "{}", "최근 90일 DART 공시 중 위험(빨강) · 호재(초록). DART 키가 있으면 자동 조회"),
     ("mcap_eok", "시총(억)", "{:,.0f}", ""),
     ("box_pct", "박스폭%", "{:.1f}", "기준 구간 (최고-최저 종가)/평균"),
     ("score", "점수", "{:.1f}", "log2(거래량배수)×10 / (1 + |기간등락| + 0.5×일중변동)"),
 ]
-NUMERIC = {c for c, *_ in COLUMNS if c not in ("ticker", "name", "market")}
+NUMERIC = {c for c, *_ in COLUMNS if c not in ("ticker", "name", "market", "disc_flag")}
 
 
 class ResultsModel(QAbstractTableModel):
@@ -1619,7 +2352,7 @@ class ResultsModel(QAbstractTableModel):
         if not index.isValid():
             return None
         col, _, fmt, _ = COLUMNS[index.column()]
-        v = self.df[col].iat[index.row()]
+        v = self.df[col].iat[index.row()] if col in self.df else ""
         if role == Qt.DisplayRole:
             if isinstance(v, float) and math.isnan(v):
                 return "–"
@@ -1635,6 +2368,8 @@ class ResultsModel(QAbstractTableModel):
                 return QColor(WARN if v >= 5 else ACCENT)
             if col == "market":
                 return QColor(MUTED)
+            if col == "disc_flag" and isinstance(v, str) and v:
+                return QColor(UP if v.startswith("위험") else GOOD)
             if col == "score":
                 return QColor(GOOD)
         if role == Qt.FontRole and col in ("name", "vol_ratio", "score"):
@@ -1709,6 +2444,28 @@ class DartWorker(QThread):
             self.done.emit(self.ticker, self.client.disclosures(self.ticker))
         except Exception as e:  # noqa: BLE001
             self.failed.emit(self.ticker, str(e))
+
+
+class DartBatchWorker(QThread):
+    """여러 종목의 최근 공시 위험/호재 표시를 한 번에 조회."""
+
+    progress = Signal(int, int)
+    done = Signal(object)  # {ticker: flag}
+
+    def __init__(self, client, tickers):
+        super().__init__()
+        self.client, self.tickers = client, list(tickers)
+
+    def run(self):
+
+        out = {}
+        for k, t in enumerate(self.tickers, 1):
+            try:
+                out[t] = summarize_flag(self.client.disclosures(t))
+            except Exception as e:  # noqa: BLE001 — 한 종목 실패는 건너뜀
+                print(f"DART {t} 조회 실패: {e}")
+            self.progress.emit(k, len(self.tickers))
+        self.done.emit(out)
 
 
 # ============================================================================
@@ -1933,6 +2690,27 @@ class AccountDialog(_Base):
         dart.body.addLayout(dart_form)
         self.layout().insertWidget(1, dart)
 
+        tg = Card("텔레그램 알림 (선택)", "자동 실행(daily_run) 결과를 받을 봇. 텔레그램 @BotFather → /newbot 으로 토큰 발급 → "
+                                       "만든 봇에게 아무 말이나 보낸 뒤 '채팅 ID 찾기'.")
+        tg_form = QFormLayout()
+        tg_form.setSpacing(10)
+        self.tg_token = _pw_edit("123456:ABC-...")
+        self.tg_token.setText(creds.telegram_token)
+        self.tg_chat = QLineEdit(creds.telegram_chat)
+        find = QPushButton("채팅 ID 찾기", objectName="Ghost")
+        find.clicked.connect(self._find_chat)
+        test = QPushButton("테스트 전송", objectName="Ghost")
+        test.clicked.connect(self._test_send)
+        tg_form.addRow("봇 토큰", self.tg_token)
+        tg_form.addRow("채팅 ID", self.tg_chat)
+        tg.body.addLayout(tg_form)
+        row = QHBoxLayout()
+        row.addWidget(find)
+        row.addWidget(test)
+        row.addStretch(1)
+        tg.body.addLayout(row)
+        self.layout().insertWidget(2, tg)
+
         self.show_btn = QPushButton("비밀번호 보기", objectName="Ghost", checkable=True)
         self.show_btn.toggled.connect(self._toggle_echo)
         change = QPushButton("계정 비밀번호 변경")
@@ -1949,13 +2727,35 @@ class AccountDialog(_Base):
 
     def _toggle_echo(self, on: bool):
         mode = QLineEdit.Normal if on else QLineEdit.Password
-        for e in (self.krx_pw, self.dart_pw, self.dart_key):
+        for e in (self.krx_pw, self.dart_pw, self.dart_key, self.tg_token):
             e.setEchoMode(mode)
         self.show_btn.setText("비밀번호 숨기기" if on else "비밀번호 보기")
 
     def creds(self) -> Credentials:
         return Credentials(self.krx_id.text().strip(), self.krx_pw.text(), self.dart_id.text().strip(),
-                           self.dart_pw.text(), self.dart_key.text().strip())
+                           self.dart_pw.text(), self.dart_key.text().strip(),
+                           self.tg_token.text().strip(), self.tg_chat.text().strip())
+
+    def _find_chat(self):
+        try:
+            cid = _busy(find_chat_id, self.tg_token.text().strip())
+        except (NotifyError, Exception) as e:  # noqa: BLE001
+            self.show_error(str(e))
+            return
+        if cid:
+            self.tg_chat.setText(cid)
+            self.show_error("")
+        else:
+            self.show_error("봇에게 먼저 아무 메시지나 보낸 뒤 다시 눌러 주세요.")
+
+    def _test_send(self):
+        try:
+            _busy(send_telegram, self.tg_token.text().strip(), self.tg_chat.text().strip(),
+                  "✅ Volume Spike Screener 테스트 메시지")
+        except Exception as e:  # noqa: BLE001
+            self.show_error(str(e))
+            return
+        QMessageBox.information(self, "텔레그램", "전송했습니다. 텔레그램을 확인하세요.")
 
     def _change_password(self):
         dlg = ChangePasswordDialog(self.vault, parent=self)
@@ -2324,6 +3124,603 @@ class PerformanceDialog(QDialog):
 
 
 # ============================================================================
+# screener/gui/backtest_view.py
+# ============================================================================
+"""백테스트 창: 과거 데이터 수집 · 매매 시뮬레이션 · 조건 최적화 · 요인 분석 · 모의투자."""
+
+import json
+import traceback
+from dataclasses import replace
+
+import matplotlib.patches as mpatches
+import numpy as np
+import pandas as pd
+from PySide6.QtCore import QDate, QSortFilterProxyModel, Qt, QThread, Signal
+from PySide6.QtWidgets import (
+    QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog, QHBoxLayout, QHeaderView, QLabel,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QTableView, QTabWidget, QVBoxLayout, QWidget,
+)
+
+
+TRADE_COLUMNS = [
+    ("entry_date", "진입일", "date"), ("exit_date", "청산일", "date"), ("ticker", "코드", "str"),
+    ("name", "종목명", "str"), ("market", "시장", "str"), ("entry", "진입가", "{:,.0f}"),
+    ("exit", "청산가", "{:,.0f}"), ("ret", "수익률", "pct"), ("days", "보유일", "{:.0f}"),
+    ("reason", "청산 사유", "str"),
+]
+FACTOR_COLUMNS = [
+    ("label", "지표", "str"), ("ic", "수익 관련성(IC)", "{:+.3f}"), ("weight", "학습 가중치", "{:+.4f}"),
+    ("days", "분석 일수", "{:.0f}"),
+]
+
+
+class TaskWorker(QThread):
+    """fn(progress, cancelled) 을 백그라운드에서 실행."""
+
+    progress = Signal(int, int, str)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            self.done.emit(self.fn(self.progress.emit, lambda: self._cancel))
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            self.failed.emit(str(e))
+
+
+def _table(model) -> QTableView:
+    proxy = QSortFilterProxyModel()
+    proxy.setSourceModel(model)
+    proxy.setSortRole(Qt.UserRole)
+    t = QTableView()
+    t.setModel(proxy)
+    t._proxy = proxy  # 참조 유지
+    t.setSortingEnabled(True)
+    t.setAlternatingRowColors(True)
+    t.setSelectionBehavior(QAbstractItemView.SelectRows)
+    t.verticalHeader().setVisible(False)
+    t.verticalHeader().setDefaultSectionSize(26)
+    t.setShowGrid(False)
+    t.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+    t.horizontalHeader().setStretchLastSection(True)
+    return t
+
+
+def _pct(v, signed=True):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "–"
+    return f"{v * 100:+.1f}%" if signed else f"{v * 100:.1f}%"
+
+
+class BacktestWindow(QDialog):
+    def __init__(self, main):
+        super().__init__(main, Qt.Window)
+        self.main = main
+        self.setWindowTitle("백테스트 · 최적화 · 요인 분석 · 모의투자")
+        self.resize(1440, 900)
+        self._worker: TaskWorker | None = None
+        self._panel = None
+        self._cands = None
+        self._cands_key = None
+        self._grid = None
+        self._factor = None
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.addWidget(self._build_side())
+        right = QVBoxLayout()
+        right.addLayout(self._build_top())
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_result_tab(), "결과")
+        self.tabs.addTab(self._build_grid_tab(), "조건 최적화")
+        self.tabs.addTab(self._build_factor_tab(), "요인 분석 · 학습 점수")
+        right.addWidget(self.tabs, 1)
+        root.addLayout(right, 1)
+        self.refresh_db_info()
+
+    # ------------------------------------------------------------------ UI
+    def _build_top(self):
+        lay = QHBoxLayout()
+        self.db_info = QLabel("", objectName="CardHint")
+        self.progress = QProgressBar()
+        self.progress.setFixedWidth(260)
+        self.progress.hide()
+        self.status = QLabel("", objectName="CardHint")
+        self.stop_btn = QPushButton("중지", objectName="Ghost")
+        self.stop_btn.clicked.connect(self._cancel)
+        self.stop_btn.hide()
+        lay.addWidget(self.db_info, 1)
+        lay.addWidget(self.status)
+        lay.addWidget(self.progress)
+        lay.addWidget(self.stop_btn)
+        return lay
+
+    def _build_side(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(340)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 0, 6, 0)
+        lay.setSpacing(12)
+
+        dc = Card("① 과거 데이터 수집", "KRX 에서 과거 전종목 시세(상장폐지 종목 포함)를 DB 에 받습니다. "
+                                      "이미 받은 날짜는 건너뛰어 중간에 멈춰도 이어받습니다.")
+        self.years = QSpinBox()
+        self.years.setRange(1, 10)
+        self.years.setValue(3)
+        self.years.setSuffix(" 년")
+        self.with_flows = QCheckBox("외국인·기관 순매수 포함 (시간 약 3배)")
+        self.bf_btn = QPushButton("과거 데이터 수집")
+        self.bf_btn.clicked.connect(self.run_backfill)
+        dc.body.addLayout(hbox(QLabel("기간", objectName="ParamLabel"), None, self.years))
+        dc.body.addWidget(self.with_flows)
+        dc.body.addWidget(self.bf_btn)
+        lay.addWidget(dc)
+
+        P = ParamSlider
+        rc = Card("② 매매 규칙", "신호 다음날 시가에 사서 아래 규칙으로 판다고 가정합니다.")
+        self.r_stop = P("손절 (0=안 함)", 0, 30, 0.5, 5, "%", 1)
+        self.r_target = P("익절 (0=안 함)", 0, 100, 1, 15, "%", 0)
+        self.r_hold = P("최대 보유", 1, 120, 1, 20, "일", 0)
+        self.r_cost = P("왕복 비용", 0, 2, 0.05, 0.25, "%", 2, "수수료 + 매도 세금 + 체결 오차(슬리피지)")
+        self.r_pos = P("동시 보유 종목", 1, 20, 1, 5, "개", 0, "자금을 N 등분해서 투자")
+        self.r_day = P("하루 신규 진입", 1, 10, 1, 2, "개", 0, "같은 날 신호가 많으면 점수 상위부터")
+        self.r_regime = QCheckBox("하락장 진입 금지 (지수 < 이동평균)")
+        self.r_regime.setChecked(True)
+        self.r_ma = P("이동평균", 20, 200, 5, 60, "일", 0)
+        self.r_regime.toggled.connect(self.r_ma.setEnabled)
+        for w in (self.r_stop, self.r_target, self.r_hold, self.r_cost, self.r_pos, self.r_day,
+                  self.r_regime, self.r_ma):
+            rc.body.addWidget(w)
+        lay.addWidget(rc)
+
+        sc = Card("③ 실행", "조건은 메인 화면 왼쪽에 지금 설정된 값을 그대로 사용합니다.")
+        self.source = QComboBox()
+        self.source.addItem("과거 백테스트 (현재 조건으로 매일 스크리닝했다면)", "backtest")
+        self.source.addItem("모의투자 (DB 에 저장된 실제 신호로 매매했다면)", "paper")
+        self.start = QDateEdit(calendarPopup=True)
+        self.end = QDateEdit(calendarPopup=True)
+        for d in (self.start, self.end):
+            d.setDisplayFormat("yyyy-MM-dd")
+        self.params_lbl = QLabel("", objectName="CardHint")
+        self.params_lbl.setWordWrap(True)
+        self.run_btn = QPushButton("백테스트 실행", objectName="Primary")
+        self.run_btn.clicked.connect(self.run_backtest)
+        sc.body.addWidget(self.source)
+        sc.body.addLayout(hbox(QLabel("시작", objectName="ParamLabel"), None, self.start))
+        sc.body.addLayout(hbox(QLabel("종료", objectName="ParamLabel"), None, self.end))
+        sc.body.addWidget(self.params_lbl)
+        sc.body.addWidget(self.run_btn)
+        lay.addWidget(sc)
+        lay.addStretch(1)
+        scroll.setWidget(inner)
+        return scroll
+
+    def _build_result_tab(self):
+        w = QWidget(objectName="Root")
+        lay = QVBoxLayout(w)
+        chips = QHBoxLayout()
+        self.k = {}
+        for key, label in (("trades", "거래 수"), ("win_rate", "승률"), ("avg_ret", "거래당 평균"),
+                           ("total", "누적 수익"), ("cagr", "연환산"), ("mdd", "최대 낙폭"),
+                           ("bench_total", "시장(전종목 평균)")):
+            c = StatChip(label, color=TEXT)
+            c.setMinimumWidth(112)
+            self.k[key] = c
+            chips.addWidget(c)
+        chips.addStretch(1)
+        lay.addLayout(chips)
+        self.result_note = QLabel("", objectName="CardHint")
+        self.result_note.setWordWrap(True)
+        lay.addWidget(self.result_note)
+        split = QSplitter(Qt.Vertical)
+        self.eq_chart = ChartWidget()
+        self.eq_chart.show_message("왼쪽에서 ‘백테스트 실행’")
+        split.addWidget(self.eq_chart)
+        self.trade_model = FrameModel(TRADE_COLUMNS, self)
+        self.trade_table = _table(self.trade_model)
+        for i, (c, *_r) in enumerate(TRADE_COLUMNS):
+            self.trade_table.setColumnWidth(i, {"name": 130, "reason": 90}.get(c, 90))
+        split.addWidget(self.trade_table)
+        split.setSizes([420, 300])
+        lay.addWidget(split, 1)
+        return w
+
+    def _build_grid_tab(self):
+        w = QWidget(objectName="Root")
+        lay = QVBoxLayout(w)
+        top = QHBoxLayout()
+        self.g_h = QComboBox()
+        for h in FWD_HORIZONS:
+            self.g_h.addItem(f"{h}일 보유 수익", h)
+        self.g_h.setCurrentIndex(1)
+        self.g_top = QSpinBox()
+        self.g_top.setRange(0, 20)
+        self.g_top.setValue(0)
+        self.g_top.setSpecialValueText("전체 신호")
+        self.g_top.setPrefix("날짜별 상위 ")
+        self.g_top.setToolTip("0 = 조건에 맞는 모든 신호, N = 날짜별 점수 상위 N개만 (실제 매매처럼)")
+        run = QPushButton("최적화 실행", objectName="Primary")
+        run.clicked.connect(self.run_grid)
+        self.g_apply = QPushButton("추천 조합을 메인 화면에 적용")
+        self.g_apply.clicked.connect(self.apply_grid)
+        self.g_apply.setEnabled(False)
+        for x in (QLabel("평가 기준"), self.g_h, self.g_top, run):
+            top.addWidget(x)
+        top.addStretch(1)
+        top.addWidget(self.g_apply)
+        lay.addLayout(top)
+        self.g_note = QLabel("거래량 배수 × 허용 등락률 조합별로, 앞쪽 2/3 기간(학습)과 뒤쪽 1/3 기간(검증)의 "
+                             "신호당 평균 수익(비용 차감)을 비교합니다. 학습 기간에서 고른 조합이 검증 기간에서도 "
+                             "좋아야 믿을 만합니다.", objectName="CardHint")
+        self.g_note.setWordWrap(True)
+        lay.addWidget(self.g_note)
+        self.g_chart = ChartWidget()
+        self.g_chart.show_message("‘최적화 실행’ — 처음에는 후보 계산에 수십 초 걸립니다")
+        lay.addWidget(self.g_chart, 1)
+        return w
+
+    def _build_factor_tab(self):
+        w = QWidget(objectName="Root")
+        lay = QVBoxLayout(w)
+        top = QHBoxLayout()
+        self.f_h = QComboBox()
+        for h in FWD_HORIZONS:
+            self.f_h.addItem(f"{h}일 보유 수익", h)
+        self.f_h.setCurrentIndex(1)
+        run = QPushButton("분석 실행", objectName="Primary")
+        run.clicked.connect(self.run_factor)
+        self.f_apply = QPushButton("학습 점수를 메인 화면 점수로 사용")
+        self.f_apply.clicked.connect(self.apply_factor)
+        self.f_apply.setEnabled(False)
+        for x in (QLabel("평가 기준"), self.f_h, run):
+            top.addWidget(x)
+        top.addStretch(1)
+        top.addWidget(self.f_apply)
+        lay.addLayout(top)
+        self.f_note = QLabel("후보 신호의 각 지표가 이후 수익과 얼마나 관련 있었는지(IC: 날짜별 순위상관 평균, "
+                             "±0.03 이상이면 의미 있는 편)와, 학습 기간 데이터로 정한 가중치 점수가 "
+                             "검증 기간에서 기본 점수보다 나았는지 보여줍니다.", objectName="CardHint")
+        self.f_note.setWordWrap(True)
+        lay.addWidget(self.f_note)
+        self.f_result = QLabel("")
+        self.f_result.setWordWrap(True)
+        self.f_result.setStyleSheet("font-size: 14px;")
+        lay.addWidget(self.f_result)
+        self.f_model = FrameModel(FACTOR_COLUMNS, self)
+        self.f_table = _table(self.f_model)
+        self.f_table.setColumnWidth(0, 260)
+        self.f_table.setSortingEnabled(False)  # 관련성 절대값 순 유지
+        lay.addWidget(self.f_table, 1)
+        return w
+
+    # ------------------------------------------------------------------ 공통
+    @property
+    def db(self) -> StockDB:
+        return StockDB(self.main.db_path)
+
+    def refresh_db_info(self):
+        try:
+            st = self.db.stats()
+        except Exception as e:  # noqa: BLE001
+            self.db_info.setText(f"DB 오류: {e}")
+            return
+        fmt = lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}" if d else "–"  # noqa: E731
+        self.db_info.setText(f"DB: {fmt(st['first'])} ~ {fmt(st['last'])} · {st['days']}영업일 · "
+                             f"수급 {st['flow_days']}일 · 저장 결과 {st['runs']}회 · {st['size_mb']:.0f}MB")
+        if st["first"]:
+            first = QDate.fromString(st["first"], "yyyyMMdd")
+            last = QDate.fromString(st["last"], "yyyyMMdd")
+            for d in (self.start, self.end):
+                d.setDateRange(first, last)
+            if self.start.date() <= first or self.start.date() > last:
+                self.start.setDate(first.addDays(120))  # 지표 계산용 앞부분 여유
+            self.end.setDate(last)
+        p = self.main.params()
+        self.params_lbl.setText(
+            f"현재 조건: 거래량 ≥{p.vol_ratio_min:g}배 · 등락 ±{p.price_chg_max:g}% · 최근 {p.recent_days}일 · "
+            f"거래대금 ≥{p.min_value_eok:g}억" + (" · 수급" if p.flow_enabled else "")
+            + (" · 바닥권" if p.pos_enabled else "") + (" · OBV" if p.obv_enabled else "")
+            + (" · 학습점수" if p.score_weights else ""))
+
+    def rules(self) -> TradeRules:
+        return TradeRules(
+            stop_pct=self.r_stop.value(), target_pct=self.r_target.value(), max_hold=int(self.r_hold.value()),
+            cost_pct=self.r_cost.value(), max_positions=int(self.r_pos.value()), per_day=int(self.r_day.value()),
+            regime_filter=self.r_regime.isChecked(), regime_ma=int(self.r_ma.value()))
+
+    def _busy(self, on: bool, msg: str = ""):
+        for b in (self.run_btn, self.bf_btn):
+            b.setEnabled(not on)
+        self.progress.setVisible(on)
+        self.stop_btn.setVisible(on)
+        self.status.setText(msg)
+
+    def _start(self, fn, on_done, msg):
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "백테스트", "다른 작업이 진행 중입니다.")
+            return
+        self._busy(True, msg)
+        self._worker = TaskWorker(fn)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.done.connect(lambda r: (self._busy(False), on_done(r)))
+        self._worker.failed.connect(lambda m: (self._busy(False), QMessageBox.critical(self, "오류", m)))
+        self._worker.start()
+
+    def _on_progress(self, i, n, msg):
+        self.progress.setMaximum(max(n, 1))
+        self.progress.setValue(i)
+        self.status.setText(msg)
+
+    def _cancel(self):
+        if self._worker is not None:
+            self._worker.cancel()
+            self.status.setText("중지하는 중…")
+
+    def shutdown(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(10000)
+
+    def _date_str(self, w: QDateEdit) -> str:
+        return w.date().toString("yyyyMMdd")
+
+    def _ensure_candidates(self, progress, cancelled):
+        """현재 조건·기간의 후보 풀 (같은 설정이면 재사용)."""
+        p = self.main.params()
+        if self._panel is None:
+            progress(0, 1, "DB 에서 과거 시세 읽는 중…")
+            self._panel = load_history(self.db)
+        key = json.dumps([loose_params(p).to_dict(), p.pos_days, self._date_str(self.start),
+                          self.r_cost.value()], sort_keys=True, default=str)
+        if self._cands is None or self._cands_key != key:
+            cands = build_candidates(self._panel, p, start=self._date_str(self.start), progress=progress,
+                                        cancelled=cancelled, cost_pct=self.r_cost.value())
+            if cancelled():
+                raise RuntimeError("중지했습니다.")
+            self._cands, self._cands_key = cands, key
+        end = pd.Timestamp(self.end.date().toPython())
+        cands = self._cands
+        return cands[cands["date"] <= end] if not cands.empty else cands
+
+    # ------------------------------------------------------------------ 과거 데이터 수집
+    def run_backfill(self):
+        m = self.main
+        if not m.ensure_unlocked():
+            return
+        if not (m.creds.krx_id and m.creds.krx_pw):
+            QMessageBox.information(self, "계정", "메인 화면 ‘계정’에서 KRX ID/비밀번호를 먼저 입력하세요.")
+            return
+        years, flows = self.years.value(), self.with_flows.isChecked()
+        calls = years * 248 * 2 * (3 if flows else 1)
+        if QMessageBox.question(
+                self, "과거 데이터 수집",
+                f"{years}년치 약 {calls:,}회 KRX 조회 (이미 받은 날짜 제외)\n"
+                f"예상 시간: {calls * 0.8 / 60:.0f}~{calls * 1.5 / 60:.0f}분.\n"
+                "중간에 ‘중지’하거나 창을 닫아도 다음에 이어서 받습니다. 시작할까요?") != QMessageBox.Yes:
+            return
+        db_path, krx_id, krx_pw = m.db_path, m.creds.krx_id, m.creds.krx_pw
+
+        def job(progress, cancelled):
+            progress(0, 1, "KRX 로그인…")
+            krx_login(krx_id, krx_pw)
+            return krx_backfill(StockDB(db_path), years=years, with_flows=flows,
+                                progress=progress, cancelled=cancelled)
+
+        def done(stats):
+            self._panel = self._cands = None
+            self.refresh_db_info()
+            QMessageBox.information(
+                self, "과거 데이터 수집",
+                ("중지했습니다. 다시 누르면 이어서 받습니다.\n" if stats["cancelled"] else "완료했습니다.\n")
+                + f"새로 받음 {stats['fetched']:,} · 이미 있음 {stats['skipped']:,} · 오류 {stats['errors']:,}")
+
+        self._start(job, done, "과거 데이터 수집 중…")
+
+    # ------------------------------------------------------------------ 백테스트
+    def run_backtest(self):
+        self.refresh_db_info()
+        rules, source = self.rules(), self.source.currentData()
+        end = pd.Timestamp(self.end.date().toPython())
+
+        def job(progress, cancelled):
+            if source == "paper":
+                if self._panel is None:
+                    progress(0, 1, "DB 에서 시세 읽는 중…")
+                    self._panel = load_history(self.db)
+                sig = saved_signals(self.db, self._panel)
+            else:
+                cands = self._ensure_candidates(progress, cancelled)
+                sig = select(cands, self.main.params())
+            sig = sig[sig["di"] < int(np.searchsorted(self._panel.dates, end, side="right"))] if len(sig) else sig
+            progress(1, 1, "매매 시뮬레이션…")
+            return simulate(sig, self._panel, rules) + (len(sig),)
+
+        self._start(job, self._show_result, "백테스트 실행 중…")
+
+    def _show_result(self, res):
+        trades, equity, m, n_sig = res
+        if equity.empty or not m.get("trades"):
+            for c in self.k.values():
+                c.set("–")
+            self.eq_chart.show_message("신호가 없습니다 — 기간·조건을 확인하세요" if self.source.currentData() == "backtest"
+                                       else "저장된 실제 신호가 없습니다 — 메인 화면에서 ‘결과 DB 저장’ 또는 자동 실행 후 확인")
+            self.trade_model.set_frame(pd.DataFrame())
+            self.result_note.setText(f"신호 {n_sig:,}개 · 매매 0건")
+            return
+        self.k["trades"].set(f"{m['trades']:,}")
+        self.k["win_rate"].set(_pct(m.get("win_rate"), signed=False))
+        self.k["avg_ret"].set(_pct(m.get("avg_ret")))
+        self.k["total"].set(_pct(m["total"]))
+        self.k["cagr"].set(_pct(m["cagr"]))
+        self.k["mdd"].set(_pct(m["mdd"]))
+        self.k["bench_total"].set(_pct(m["bench_total"]))
+        for key in ("avg_ret", "total", "cagr"):
+            v = m.get(key, 0) or 0
+            self.k[key].value_lbl.setStyleSheet(f"color: {UP if v > 0 else DOWN};")
+        self.result_note.setText(
+            f"{m['start']:%Y-%m-%d} ~ {m['end']:%Y-%m-%d} · 신호 {n_sig:,}개 중 {m['trades']:,}건 매매 · "
+            f"평균 보유 {m.get('avg_days', 0):.1f}일 · 평균 이익 {_pct(m.get('avg_win'))} / 평균 손실 {_pct(m.get('avg_loss'))} · "
+            f"평균 투자 비중 {m['exposure'] * 100:.0f}% · 비용 {self.r_cost.value():.2f}% 차감 · "
+            "과거 성과가 미래를 보장하지 않습니다.")
+        t = trades.copy()
+        for c in ("entry_date", "exit_date"):
+            t[c] = pd.to_datetime(t[c]).dt.strftime("%Y%m%d")
+        self.trade_model.set_frame(t)
+        self.trade_table.sortByColumn(0, Qt.DescendingOrder)
+        self._plot_equity(equity)
+
+    def _plot_equity(self, eq: pd.DataFrame):
+        fig = self.eq_chart.fig
+        fig.clear()
+        gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.08, left=0.07, right=0.98, top=0.9, bottom=0.1)
+        ax = fig.add_subplot(gs[0])
+        axd = fig.add_subplot(gs[1], sharex=ax)
+        for a in (ax, axd):
+            self.eq_chart._style(a)
+        ax.plot(eq["date"], (eq["equity"] - 1) * 100, color=ACCENT, linewidth=1.6, label="전략")
+        ax.plot(eq["date"], (eq["bench"] - 1) * 100, color=MUTED, linewidth=1, linestyle="--", label="시장 평균")
+        ax.axhline(0, color=BORDER, linewidth=1)
+        ax.set_ylabel("누적 수익률 (%)", color=MUTED, fontsize=9)
+        leg = ax.legend(facecolor=SURFACE, edgecolor=BORDER, fontsize=9, loc="upper left")
+        for t in leg.get_texts():
+            t.set_color(TEXT)
+        dd = (eq["equity"] / eq["equity"].cummax() - 1) * 100
+        axd.fill_between(eq["date"], dd, 0, color=DOWN, alpha=0.35)
+        axd.set_ylabel("낙폭 (%)", color=MUTED, fontsize=9)
+        ax.tick_params(labelbottom=False)
+        fig.suptitle("누적 수익률 · 최대 낙폭", color=TEXT, fontsize=11, x=0.07, ha="left")
+        self.eq_chart.draw_idle()
+
+    # ------------------------------------------------------------------ 최적화
+    def run_grid(self):
+        h, top = self.g_h.currentData(), self.g_top.value()
+        p = self.main.params()
+
+        def job(progress, cancelled):
+            cands = self._ensure_candidates(progress, cancelled)
+            progress(1, 1, "조합별 성과 계산…")
+            return grid_search(cands, p, horizon=h, top_per_day=top)
+
+        self._start(job, self._show_grid, "최적화 중…")
+
+    def _show_grid(self, grid: pd.DataFrame):
+        self._grid = grid
+        p = self.main.params()
+        best = best_cell(grid)
+        self.g_apply.setEnabled(best is not None)
+        vols, chgs = list(GRID_VOL), list(GRID_CHG)
+        mat = grid.pivot(index="price_chg_max", columns="vol_ratio_min", values="train_mean").reindex(
+            index=chgs, columns=vols).to_numpy() * 100
+        fig = self.g_chart.fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        self.g_chart._style(ax)
+        ax.grid(False)
+        lim = np.nanmax(np.abs(mat)) if np.isfinite(mat).any() else 1
+        im = ax.imshow(mat, cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto", origin="lower")
+        ax.set_xticks(range(len(vols)), [f"{v:g}배" for v in vols])
+        ax.set_yticks(range(len(chgs)), [f"±{c:g}%" for c in chgs])
+        ax.set_xlabel("거래량 배수 ≥", color=MUTED)
+        ax.set_ylabel("허용 등락률", color=MUTED)
+        for r in grid.itertuples():
+            i, j = chgs.index(r.price_chg_max), vols.index(r.vol_ratio_min)
+            txt = (f"{r.train_mean * 100:+.2f}%\n검증 {r.test_mean * 100:+.2f}%\n{int(r.train_n)}건"
+                   if r.train_n else "신호 없음")
+            light = r.train_n and abs(r.train_mean * 100) < lim * 0.55  # 밝은 칸은 어두운 글씨
+            ax.text(j, i, txt, ha="center", va="center", fontsize=7.5,
+                    color="#1b2033" if light else TEXT)
+        if best is not None:
+            ax.add_patch(mpatches.Rectangle(
+                (vols.index(best.vol_ratio_min) - 0.5, chgs.index(best.price_chg_max) - 0.5), 1, 1,
+                fill=False, edgecolor=GOOD, linewidth=2.5))
+        cb = fig.colorbar(im, ax=ax, fraction=0.03)
+        cb.ax.tick_params(colors=MUTED, labelsize=8)
+        fig.subplots_adjust(left=0.08, right=0.95, top=0.9, bottom=0.12)
+        h = self.g_h.currentData()
+        fig.suptitle(f"학습 기간 신호당 평균 {h}일 수익 (색) · 검증 기간 결과 · 초록 테두리 = 추천",
+                     color=TEXT, fontsize=11, x=0.08, ha="left")
+        self.g_chart.draw_idle()
+
+        cur = grid[(grid.vol_ratio_min == min(vols, key=lambda v: abs(v - p.vol_ratio_min)))
+                   & (grid.price_chg_max == min(chgs, key=lambda c: abs(c - p.price_chg_max)))]
+        msg = f"검증 시작일 {grid.attrs['split']:%Y-%m-%d}. "
+        if best is not None:
+            msg += (f"추천: 거래량 ≥{best.vol_ratio_min:g}배 · 등락 ±{best.price_chg_max:g}% → 학습 "
+                    f"{best.train_mean * 100:+.2f}% ({int(best.train_n)}건, 승률 {best.train_win * 100:.0f}%), "
+                    f"검증 {_pct(best.test_mean)} ({int(best.test_n)}건). ")
+        else:
+            msg += "학습 기간 신호 30건 이상인 조합이 없어 추천하지 않습니다. "
+        if not cur.empty:
+            c = cur.iloc[0]
+            msg += f"현재 조건과 가장 가까운 칸: 학습 {_pct(c.train_mean)}, 검증 {_pct(c.test_mean)}."
+        self.g_note.setText(msg)
+
+    def apply_grid(self):
+        best = best_cell(self._grid) if self._grid is not None else None
+        if best is None:
+            return
+        p = self.main.params()
+        self.main.set_params(replace(p, vol_ratio_min=float(best.vol_ratio_min),
+                                     price_chg_max=float(best.price_chg_max),
+                                     daily_chg_max=max(p.daily_chg_max, float(best.price_chg_max))))
+        self.refresh_db_info()
+        QMessageBox.information(self, "적용", "메인 화면 조건에 적용했습니다. ‘결과’ 탭에서 다시 백테스트해 보세요.")
+
+    # ------------------------------------------------------------------ 요인 분석
+    def run_factor(self):
+        h = self.f_h.currentData()
+        p = self.main.params()
+
+        def job(progress, cancelled):
+            cands = self._ensure_candidates(progress, cancelled)
+            progress(1, 1, "요인 분석…")
+            return factor_analysis(cands, replace(p, score_weights=None), horizon=h)
+
+        self._start(job, self._show_factor, "요인 분석 중…")
+
+    def _show_factor(self, fa: dict):
+        if "error" in fa:
+            self.f_result.setText(fa["error"])
+            self.f_apply.setEnabled(False)
+            return
+        self._factor = fa
+        self.f_model.set_frame(fa["table"])
+        t = fa["test"]
+        if t:
+            better = (t["learned_top"]["mean"] or 0) > (t["base_top"]["mean"] or 0)
+            self.f_result.setText(
+                f"검증 기간({fa['split']:%Y-%m-%d}~) 날짜별 상위 3개 평균 {fa['horizon']}일 수익 — "
+                f"<b>학습 점수 {_pct(t['learned_top']['mean'], True)}</b> (승률 {_pct(t['learned_top']['win'], False)}) vs "
+                f"기본 점수 {_pct(t['base_top']['mean'])} (승률 {_pct(t['base_top']['win'], False)}) · "
+                f"후보 전체 평균 {_pct(t['all']['mean'])}. "
+                + ("<span style='color:%s'>학습 점수가 더 나았습니다.</span>" % GOOD if better else
+                   "<span style='color:%s'>학습 점수가 낫지 않았습니다 — 적용을 권하지 않습니다.</span>" % WARN))
+            self.f_apply.setEnabled(True)
+        else:
+            self.f_result.setText("검증 기간 데이터가 없습니다.")
+            self.f_apply.setEnabled(False)
+
+    def apply_factor(self):
+        if not self._factor:
+            return
+        self.main._set_weights(self._factor["weights"])
+        self.refresh_db_info()
+        QMessageBox.information(self, "적용", "메인 화면 점수를 학습 점수로 바꿨습니다. (⑥ 추가 필터에서 되돌릴 수 있음)")
+
+
+# ============================================================================
 # screener/gui/main_window.py
 # ============================================================================
 import datetime as dt
@@ -2371,6 +3768,10 @@ class MainWindow(QMainWindow):
         self._dart_client = None
         self._selected: str | None = None
         self._panel_source = ""
+        self._score_weights: dict | None = None
+        self._disc_cache: dict[str, str] = {}
+        self._disc_batch: DartBatchWorker | None = None
+        self._bt_win = None
         self.db_path = self.settings.value("db_path") or str(default_db_path())
 
         self._debounce = QTimer(self, singleShot=True, interval=150)
@@ -2406,7 +3807,9 @@ class MainWindow(QMainWindow):
 
     def shutdown(self):
         """백그라운드 스레드가 끝날 때까지 기다린다 (종료 시 크래시 방지)."""
-        for w in [self._loader, *self._dart_workers]:
+        if self._bt_win is not None:
+            self._bt_win.shutdown()
+        for w in [self._loader, self._disc_batch, *self._dart_workers]:
             if w is not None and w.isRunning():
                 w.wait(5000)
         self.chart.fig.clear()
@@ -2446,6 +3849,9 @@ class MainWindow(QMainWindow):
         save = QPushButton("결과 DB 저장", objectName="Ghost")
         save.setToolTip("현재 스크리닝 결과와 조건을 DB 에 기록 (나중에 신호 이후 수익률 추적용)")
         save.clicked.connect(self.save_results)
+        bt_btn = QPushButton("백테스트", objectName="Ghost")
+        bt_btn.setToolTip("3년치 과거 데이터로 조건 검증 · 최적화 · 요인 분석 · 모의투자")
+        bt_btn.clicked.connect(self.open_backtest)
         perf = QPushButton("성과", objectName="Ghost")
         perf.setToolTip("저장한 스크리닝 결과의 이후 1·5·10·20일 수익률")
         perf.clicked.connect(lambda: PerformanceDialog(self.db_path, self).exec())
@@ -2453,7 +3859,7 @@ class MainWindow(QMainWindow):
         db_btn.setToolTip("데이터 저장 위치 · 저장된 기간 보기 / 위치 변경")
         db_btn.clicked.connect(self.open_db_dialog)
         for w in (QLabel("소스"), self.source, QLabel("기준일"), self.date_edit,
-                  self.load_btn, acct, db_btn, save, perf, export):
+                  self.load_btn, acct, db_btn, save, perf, bt_btn, export):
             lay.addWidget(w)
         return h
 
@@ -2542,6 +3948,26 @@ class MainWindow(QMainWindow):
             fc.body.addWidget(w)
         lay.addWidget(fc)
 
+        xc = Card("⑥ 추가 필터", "백테스트로 효과를 확인한 뒤 켜는 것을 권합니다.")
+        self.pos_on = QCheckBox("바닥권만 (저점 대비 상승률 제한)")
+        self.p_pos_days = P("저점 기준 기간", 20, 250, 5, 60, "일", 0)
+        self.p_pos_max = P("저점 대비 상승률 ≤", 0, 200, 1, 30, "%", 0,
+                           "최근 N일 최저 종가 대비 현재가 상승률 — 고점권 '물량 넘기기' 회피")
+        self.obv_on = QCheckBox("매집 추세 (OBV)")
+        self.p_obv = P("OBV 추세 ≥", -1, 1, 0.05, 0.05, "", 2,
+                       "기준+최근 구간 (상승일 거래량 − 하락일 거래량) ÷ 전체 거래량. +면 매집, −면 분배")
+        self.ex_expiry = QCheckBox("옵션 만기일(매월 둘째 목요일) 신호 제외")
+        self.hide_risk = QCheckBox("DART 위험 공시 종목 숨김 (유상증자·CB·감자 등)")
+        self.hide_risk.setChecked(self.settings.value("hide_risk", "false") == "true")
+        self.learned_lbl = QLabel("", objectName="CardHint")
+        self.learned_lbl.setWordWrap(True)
+        self.learned_clear = QPushButton("기본 점수로 되돌리기", objectName="Ghost")
+        self.learned_clear.clicked.connect(lambda: self._set_weights(None))
+        for w in (self.pos_on, self.p_pos_days, self.p_pos_max, self.obv_on, self.p_obv,
+                  self.ex_expiry, self.hide_risk, self.learned_lbl, self.learned_clear):
+            xc.body.addWidget(w)
+        lay.addWidget(xc)
+
         reset = QPushButton("기본값으로 초기화", objectName="Ghost")
         reset.clicked.connect(lambda: self.set_params(ScreenParams()))
         lay.addWidget(reset)
@@ -2549,8 +3975,14 @@ class MainWindow(QMainWindow):
 
         for s in self._sliders():
             s.valueChanged.connect(self._schedule)
-        for c in (self.use_box, self.kospi, self.kosdaq, self.ex_pref, self.ex_spac, self.flow_on):
+        for c in (self.use_box, self.kospi, self.kosdaq, self.ex_pref, self.ex_spac, self.flow_on,
+                  self.pos_on, self.obv_on, self.ex_expiry, self.hide_risk):
             c.toggled.connect(self._schedule)
+        for chk, ws in ((self.pos_on, (self.p_pos_days, self.p_pos_max)), (self.obv_on, (self.p_obv,))):
+            for w in ws:
+                chk.toggled.connect(w.setEnabled)
+                w.setEnabled(False)
+        self._set_weights(None)
         self.base_stat.currentIndexChanged.connect(self._schedule)
         self.flow_mode.currentIndexChanged.connect(self._schedule)
         for w in (self.flow_mode, self.p_flow_days, self.p_flow_eok, self.p_flow_buy_days):
@@ -2572,9 +4004,11 @@ class MainWindow(QMainWindow):
         self.chip_kospi = StatChip("KOSPI", color=ACCENT)
         self.chip_kosdaq = StatChip("KOSDAQ", color=ACCENT_2)
         self.chip_asof = StatChip("기준일 · 데이터 기간", color=TEXT)
+        self.chip_regime = StatChip("시장 추세 (지수 vs 60일선)", color=TEXT)
         chips = QHBoxLayout()
         chips.setSpacing(10)
-        for c in (self.chip_total, self.chip_hits, self.chip_kospi, self.chip_kosdaq, self.chip_asof):
+        for c in (self.chip_total, self.chip_hits, self.chip_kospi, self.chip_kosdaq, self.chip_asof,
+                  self.chip_regime):
             chips.addWidget(c)
         chips.addStretch(1)
         self.search = QLineEdit(placeholderText="종목명 / 코드 검색")
@@ -2632,7 +4066,7 @@ class MainWindow(QMainWindow):
         return [self.p_base_days, self.p_recent_days, self.p_vol_min, self.p_vol_max, self.p_chg,
                 self.p_daily, self.p_range, self.p_box, self.p_value, self.p_price,
                 self.p_mcap_min, self.p_mcap_max, self.p_flow_days, self.p_flow_eok,
-                self.p_flow_buy_days]
+                self.p_flow_buy_days, self.p_pos_days, self.p_pos_max, self.p_obv]
 
     def params(self) -> ScreenParams:
         markets = tuple(m for m, cb in (("KOSPI", self.kospi), ("KOSDAQ", self.kosdaq)) if cb.isChecked())
@@ -2649,6 +4083,10 @@ class MainWindow(QMainWindow):
             flow_enabled=self.flow_on.isChecked(), flow_mode=self.flow_mode.currentData(),
             flow_days=int(self.p_flow_days.value()), flow_min_eok=self.p_flow_eok.value(),
             flow_min_buy_days=int(self.p_flow_buy_days.value()),
+            pos_enabled=self.pos_on.isChecked(), pos_days=int(self.p_pos_days.value()),
+            pos_max_pct=self.p_pos_max.value(), obv_enabled=self.obv_on.isChecked(),
+            obv_min=self.p_obv.value(), exclude_expiry=self.ex_expiry.isChecked(),
+            score_weights=self._score_weights,
         )
 
     def set_params(self, p: ScreenParams):
@@ -2660,7 +4098,8 @@ class MainWindow(QMainWindow):
                  (self.p_value, p.min_value_eok), (self.p_price, p.min_price),
                  (self.p_mcap_min, p.mcap_min_eok), (self.p_mcap_max, p.mcap_max_eok),
                  (self.p_flow_days, p.flow_days), (self.p_flow_eok, p.flow_min_eok),
-                 (self.p_flow_buy_days, p.flow_min_buy_days)]
+                 (self.p_flow_buy_days, p.flow_min_buy_days), (self.p_pos_days, p.pos_days),
+                 (self.p_pos_max, p.pos_max_pct), (self.p_obv, p.obv_min)]
         for w, val in pairs:
             w.setValue(val)
         self.base_stat.setCurrentIndex(max(0, self.base_stat.findData(p.base_stat)))
@@ -2671,6 +4110,10 @@ class MainWindow(QMainWindow):
         self.ex_spac.setChecked(p.exclude_spac)
         self.flow_on.setChecked(p.flow_enabled)
         self.flow_mode.setCurrentIndex(max(0, self.flow_mode.findData(p.flow_mode)))
+        self.pos_on.setChecked(p.pos_enabled)
+        self.obv_on.setChecked(p.obv_enabled)
+        self.ex_expiry.setChecked(p.exclude_expiry)
+        self._set_weights(p.score_weights)
         self._debounce.blockSignals(False)
         self._schedule()
 
@@ -2780,6 +4223,14 @@ class MainWindow(QMainWindow):
         d = panel.dates
         self.chip_total.set(f"{panel.close.shape[1]:,}")
         self.chip_asof.set(f"{d[-1]:%m/%d} · {len(d)}일")
+        try:
+            reg = current_regime(panel)
+            self.chip_regime.set(" · ".join(f"{m} {'▲' if ok else '▼'}" for m, ok in reg.items()))
+            self.chip_regime.value_lbl.setStyleSheet(f"color: {GOOD if all(reg.values()) else WARN};")
+            self.chip_regime.setToolTip("▲ 지수가 60일 이동평균 위 (상승 추세) · ▼ 아래 (하락 추세 — 신호 신뢰도 낮음)")
+        except Exception as e:  # noqa: BLE001
+            self.chip_regime.set("–")
+            print(f"시장 추세 계산 실패: {e}")
         self.statusBar().showMessage(
             f"{d[0]:%Y-%m-%d} ~ {d[-1]:%Y-%m-%d}, {panel.close.shape[1]:,}종목 로드 완료. "
             "왼쪽 조건을 조정하면 즉시 다시 스크리닝됩니다.")
@@ -2808,7 +4259,13 @@ class MainWindow(QMainWindow):
         self.flow_warn.setText("⚠ 투자자별 순매수 데이터가 없어 수급 조건을 만족하는 종목이 없습니다. "
                                "데이터를 다시 불러오세요." if no_flows else "")
         self.flow_warn.setVisible(no_flows and p.flow_enabled)
-        self.result = run_screen(self.panel, p)
+        self.settings.setValue("hide_risk", "true" if self.hide_risk.isChecked() else "false")
+        result = run_screen(self.panel, p)
+        result["disc_flag"] = result["ticker"].map(self._disc_cache).fillna("")
+        if self.hide_risk.isChecked():
+            result = result[~result["disc_flag"].str.startswith("위험")].reset_index(drop=True)
+        self.result = result
+        self._fetch_disc_flags(result["ticker"])
         self.model.set_frame(self.result)
         self.table.sortByColumn(len(COLUMNS) - 1, Qt.DescendingOrder)  # 점수 내림차순
         mk = self.result["market"].value_counts()
@@ -2821,6 +4278,43 @@ class MainWindow(QMainWindow):
         else:
             self.chart.show_message("조건을 만족하는 종목이 없습니다 — 조건을 완화해 보세요")
             self.disc.clear()
+
+    def _set_weights(self, w: dict | None):
+        self._score_weights = w
+        self.learned_lbl.setText("점수: 백테스트 요인 분석으로 학습한 가중치 사용 중" if w else
+                                 "점수: 기본 공식 (거래량 배수↑, 가격 변동↓)")
+        self.learned_clear.setVisible(bool(w))
+        self._schedule()
+
+    def _fetch_disc_flags(self, tickers):
+        """결과 종목의 위험/호재 공시 표시를 백그라운드로 조회 (실데이터 + DART 키 있을 때)."""
+        if (self._panel_source != "krx" or self.creds is None or not self.creds.dart_key
+                or (self._disc_batch is not None and self._disc_batch.isRunning())):
+            return
+        missing = [t for t in tickers if t not in self._disc_cache][:60]
+        if not missing:
+            return
+        if self._dart_client is None:
+            self._dart_client = DartClient(self.creds.dart_key)
+        self._disc_pending = missing
+        self._disc_batch = DartBatchWorker(self._dart_client, missing)
+        self._disc_batch.progress.connect(
+            lambda k, n: self.statusBar().showMessage(f"DART 공시 확인 {k}/{n}"))
+        self._disc_batch.done.connect(self._on_disc_flags)
+        self._disc_batch.start()
+
+    def _on_disc_flags(self, flags: dict):
+        for t in self._disc_pending:  # 조회 실패 종목도 '확인함'으로 기록해 무한 재조회 방지
+            self._disc_cache[t] = flags.get(t, "")
+        self.statusBar().showMessage(f"DART 공시 확인 완료 ({len(flags)}종목)", 4000)
+        self.rescreen()
+
+    def open_backtest(self):
+        if self._bt_win is None:
+            self._bt_win = BacktestWindow(self)
+        self._bt_win.show()
+        self._bt_win.raise_()
+        self._bt_win.refresh_db_info()
 
     def _row_of(self, ticker: str) -> int | None:
         for r in range(self.proxy.rowCount()):
@@ -2872,6 +4366,7 @@ class MainWindow(QMainWindow):
         if df.empty:
             QTreeWidgetItem(self.disc, ["", "최근 90일 공시 없음"])
             return
+        self._disc_cache[ticker] = summarize_flag(df)
         colors = {"risk": QColor(UP), "positive": QColor(GOOD)}
         for r in df.itertuples():
             it = QTreeWidgetItem(self.disc, [f"{r.date[2:4]}.{r.date[4:6]}.{r.date[6:]}", r.title])

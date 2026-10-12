@@ -21,6 +21,7 @@ from ..paths import cache_dir
 # 예전 버전의 .pkl 캐시 위치 (DB 로 이전할 때만 사용)
 LEGACY_CACHE_DIR = cache_dir("krx")
 FINAL_HOUR = 18  # 이 시각 이후의 당일 데이터는 확정으로 보고 DB 에 고정
+INDEX_CODES = {"KOSPI": "1001", "KOSDAQ": "2001"}
 # pykrx 투자자 구분 이름
 INVESTOR_NAMES = {"foreign": "외국인", "inst": "기관합계"}
 OHLCV_COLS = {"시가": "open", "고가": "high", "저가": "low", "종가": "close",
@@ -145,9 +146,15 @@ def load_panel(end: dt.date, days: int, markets=("KOSPI", "KOSDAQ"),
         db.save_names(new, market_of.to_dict())
         names.update(new)
     meta["name"] = [names.get(t, "") for t in meta.index]
+    try:  # 시장 국면(지수 vs 이동평균) 판단용 지수 — 2회 호출
+        fetch_index(db, (end - dt.timedelta(days=150)).strftime("%Y%m%d"), trade_dates[-1])
+    except Exception as e:  # noqa: BLE001
+        print(f"지수 수집 실패 (전종목 평균으로 대체): {e}")
     progress(total, total, f"완료 — KRX 신규 조회 {fetched}일분, 나머지는 DB 사용")
     # 상장 전/거래정지 등 결측은 NaN 으로 둔다 (0 으로 채우면 평소 거래량이 왜곡됨)
-    return Panel(**wide, meta=meta, flows=flows)
+    panel = Panel(**wide, meta=meta, flows=flows)
+    panel.index_close = {m: db.load_index(c) for m, c in INDEX_CODES.items()}
+    return panel
 
 
 def _load_flows(db: StockDB, dates, markets, progress, step, total, sleep):
@@ -182,3 +189,90 @@ def _safe_name(stock, ticker: str) -> str:
         return stock.get_market_ticker_name(ticker)
     except Exception:
         return ""
+
+
+BACKFILL_DAYS_PER_YEAR = 248
+
+
+def fetch_index(db: StockDB, start: str, end: str) -> int:
+    """KOSPI/KOSDAQ 지수 종가를 DB 에 저장 (시장 국면 필터용). 저장한 일수 반환."""
+    from pykrx import stock
+
+    n = 0
+    for code in INDEX_CODES.values():
+        df = stock.get_index_ohlcv_by_date(start, end, code, name_display=False)
+        if df is None or df.empty:
+            continue
+        s = df["종가"]
+        s.index = [pd.Timestamp(d).strftime("%Y%m%d") for d in s.index]
+        db.save_index(code, s)
+        n = max(n, len(s))
+    return n
+
+
+def backfill(db: StockDB, years: int = 3, end: dt.date | None = None, markets=("KOSPI", "KOSDAQ"),
+             with_flows: bool = True, progress: Progress | None = None,
+             cancelled=lambda: False, sleep: float = 0.3) -> dict:
+    """과거 years 년치 전종목 시세(상장폐지 종목 포함)를 DB 에 채운다.
+
+    이미 받은 날짜는 건너뛰므로 중간에 멈춰도 다시 실행하면 이어서 받는다.
+    날짜 하나가 실패해도 전체를 멈추지 않고 건너뛴 뒤 개수를 보고한다.
+    """
+    from pykrx import stock
+
+    progress = progress or (lambda *_: None)
+    end = end or dt.date.today()
+    progress(0, 1, "영업일 목록 조회…")
+    dates = _business_days(end, years * BACKFILL_DAYS_PER_YEAR)
+    kinds = ["ohlcv"] + ([f"flow_{k}" for k in INVESTOR_NAMES] if with_flows else [])
+    todo = [(d, m, k) for d in dates for m in markets for k in kinds if not db.fetched(d, m, k)]
+    total = len(todo) + 2
+    stats = {"days": len(dates), "fetched": 0, "skipped": len(dates) * len(markets) * len(kinds) - len(todo),
+             "errors": 0, "cancelled": False}
+    for step, (date, market, kind) in enumerate(todo, 1):
+        if cancelled():
+            stats["cancelled"] = True
+            break
+        progress(step, total, f"{date} {market} {'시세' if kind == 'ohlcv' else INVESTOR_NAMES[kind[5:]] + ' 순매수'}"
+                              f"  ({step}/{len(todo)}, 오류 {stats['errors']})")
+        for attempt in (1, 2):
+            try:
+                if kind == "ohlcv":
+                    _fetch_day(db, date, market)
+                else:
+                    inv = kind[5:]
+                    df = stock.get_market_net_purchases_of_equities_by_ticker(
+                        date, date, market=market, investor=INVESTOR_NAMES[inv])
+                    s = (df["순매수거래대금"].astype(float) if df is not None and not df.empty
+                         else pd.Series(dtype=float))
+                    db.save_flow(date, market, inv, s, final=is_final(date))
+                stats["fetched"] += 1
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 2:
+                    stats["errors"] += 1
+                    print(f"백필 실패 {date} {market} {kind}: {e}")
+                else:
+                    time.sleep(2)
+        time.sleep(sleep)
+
+    if not stats["cancelled"] and dates:
+        progress(total - 1, total, "지수 · 상장주식수 · 종목명")
+        try:
+            fetch_index(db, dates[0], dates[-1])
+        except Exception as e:  # noqa: BLE001
+            print(f"지수 수집 실패 (시장 국면은 전종목 평균으로 대체): {e}")
+        last = db.trade_dates()[-1:] or [dates[-1]]
+        if db.load_caps(last[0]).empty:
+            try:
+                raw = pd.concat([stock.get_market_cap_by_ticker(last[0], market=m) for m in markets])
+                db.save_caps(last[0], pd.DataFrame({"market_cap": raw["시가총액"], "shares": raw["상장주식수"]}))
+            except Exception as e:  # noqa: BLE001
+                print(f"시가총액 수집 실패: {e}")
+        names = db.load_names()
+        markets_of = db.ticker_markets()
+        missing = [t for t in markets_of.index if t not in names]
+        if missing:
+            db.save_names({t: _safe_name(stock, t) for t in missing}, markets_of.to_dict())
+    progress(total, total, "완료")
+    return stats

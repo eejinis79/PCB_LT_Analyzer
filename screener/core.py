@@ -86,6 +86,18 @@ class ScreenParams:
     flow_min_eok: float = 0.0      # 기간 순매수금액 하한 (억원). 0 이면 '순매수(>0)'만 요구
     flow_min_buy_days: int = 1     # 기간 중 순매수한 날 수 하한
 
+    # 추가 필터
+    pos_enabled: bool = False      # 위치 필터: 최근 pos_days 저점 대비 상승률 상한 (바닥권만)
+    pos_days: int = 60
+    pos_max_pct: float = 30.0
+    obv_enabled: bool = False      # 매집(OBV) 필터: 기준+최근 구간 OBV 추세 하한
+    obv_min: float = 0.05          # -1(분배) ~ +1(매집)
+    exclude_expiry: bool = False   # 옵션 만기일(매월 둘째 목요일) 신호 제외
+
+    # 점수: None 이면 기본 공식, 백테스트 '요인 분석'에서 학습한 가중치를 넣으면 그것을 사용
+    # {특징이름: [가중치, 평균, 표준편차]}
+    score_weights: dict | None = None
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["markets"] = list(self.markets)
@@ -102,14 +114,30 @@ class ScreenParams:
     @property
     def required_days(self) -> int:
         # +1: 최근 구간 직전 종가(누적 등락률 기준점)
-        return self.base_days + self.recent_days + 1
+        need = self.base_days + self.recent_days + 1
+        if self.pos_enabled:
+            need = max(need, self.pos_days)
+        return need
 
 
 RESULT_COLUMNS = [
     "ticker", "name", "market", "close", "chg_pct", "max_daily_chg", "max_range",
     "vol_ratio", "recent_vol", "base_vol", "value_eok", "frg_eok", "inst_eok",
-    "frg_days", "inst_days", "mcap_eok", "box_pct", "score",
+    "frg_days", "inst_days", "mcap_eok", "box_pct", "pos_pct", "obv_trend", "score",
 ]
+
+# 학습 점수에 쓰는 특징 (features() 결과 컬럼으로 계산)
+LEARN_FEATURES = {
+    "log_vol_ratio": "거래량 배수(log)",
+    "abs_chg": "기간 등락률 절대값",
+    "max_range": "일중 변동폭",
+    "log_value": "거래대금(log)",
+    "log_mcap": "시가총액(log)",
+    "flow_ratio": "외국인+기관 순매수 / 거래대금",
+    "pos_pct": "저점 대비 위치",
+    "obv_trend": "OBV 매집 추세",
+    "box_pct": "기준구간 박스폭",
+}
 
 
 def is_preferred(ticker: str) -> bool:
@@ -146,12 +174,25 @@ def flow_mask(fs: pd.DataFrame, p: ScreenParams) -> pd.Series:
     }[p.flow_mode]
 
 
-def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
-    """조건에 맞는 종목을 score 내림차순으로 반환."""
-    n = len(panel.dates)
-    if n < p.recent_days + 2:
-        return pd.DataFrame(columns=RESULT_COLUMNS)
+def second_thursday(year: int, month: int) -> pd.Timestamp:
+    offset = (3 - pd.Timestamp(year=year, month=month, day=1).weekday()) % 7  # 목요일 = 3
+    return pd.Timestamp(year=year, month=month, day=1 + offset + 7)
 
+
+def is_option_expiry(day: pd.Timestamp, trading_dates) -> bool:
+    """매월 둘째 목요일(휴장이면 직전 거래일) 여부."""
+    day = pd.Timestamp(day).normalize()
+    nominal = second_thursday(day.year, day.month)
+    dates = pd.DatetimeIndex(trading_dates).normalize()
+    if nominal in dates or nominal > dates[-1]:
+        return day == nominal
+    prior = dates[(dates < nominal) & (dates.month == nominal.month)]
+    return len(prior) > 0 and day == prior[-1]
+
+
+def features(panel: Panel, p: ScreenParams) -> pd.DataFrame:
+    """기준일(패널 마지막 날) 기준 전 종목 지표. 필터는 적용하지 않는다."""
+    n = len(panel.dates)
     recent = slice(n - p.recent_days, n)
     base_start = max(0, n - p.recent_days - p.base_days)
     base = slice(base_start, n - p.recent_days)
@@ -173,27 +214,35 @@ def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
     prev_close = close.shift(1).replace(0, np.nan)
     daily_chg = ((close / prev_close - 1) * 100).iloc[recent]
     day_range = ((panel.high - panel.low) / prev_close * 100).iloc[recent]
-    max_daily_chg = daily_chg.abs().max()
-    max_range = day_range.max()
 
     base_close = close.iloc[base].replace(0, np.nan)
     box_pct = (base_close.max() - base_close.min()) / base_close.mean() * 100
 
-    value_eok = panel.value.iloc[recent].mean() / 1e8
-    # 최근 구간에 거래정지(거래량 0)일이 있으면 제외
-    halted = (vol.iloc[recent] == 0).any()
+    # 위치: 최근 pos_days 종가 최저 대비 현재 상승률(%)
+    low_close = close.iloc[-p.pos_days:].replace(0, np.nan).min()
+    pos_pct = (last_close / low_close - 1) * 100
+
+    # OBV 추세: (기준+최근 구간 OBV 변화) / 같은 구간 거래량 합 → -1 ~ +1
+    win = slice(base_start, n)
+    direction = np.sign(close.diff()).iloc[win].fillna(0)
+    v = vol.iloc[win]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        obv_trend = (direction * v).sum() / v.sum().replace(0, np.nan)
 
     df = pd.DataFrame({
         "close": last_close,
         "chg_pct": chg_pct,
-        "max_daily_chg": max_daily_chg,
-        "max_range": max_range,
+        "max_daily_chg": daily_chg.abs().max(),
+        "max_range": day_range.max(),
         "vol_ratio": vol_ratio,
         "recent_vol": recent_vol,
         "base_vol": base_vol,
-        "value_eok": value_eok,
+        "value_eok": panel.value.iloc[recent].mean() / 1e8,
         "box_pct": box_pct,
-        "halted": halted,
+        "pos_pct": pos_pct,
+        "obv_trend": obv_trend,
+        # 최근 구간에 거래정지(거래량 0)일이 있으면 제외
+        "halted": (vol.iloc[recent] == 0).any(),
     })
     df.index.name = "ticker"
 
@@ -203,11 +252,15 @@ def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
     mcap = meta.get("market_cap", pd.Series(index=df.index, dtype=float))
     df["mcap_eok"] = mcap / 1e8
     fs = flow_stats(panel, p.flow_days).reindex(df.index)
-    for c in ("frg_eok", "inst_eok", "frg_days", "inst_days"):
+    for c in fs.columns:
         df[c] = fs[c]
+    return df
 
+
+def filter_mask(df: pd.DataFrame, p: ScreenParams, expiry=False) -> pd.Series:
+    """features() 결과에 조건을 적용한 bool 마스크. expiry 는 bool 또는 행별 bool 배열."""
     m = (
-        ~df["halted"]
+        ~df["halted"].astype(bool)
         & df["market"].isin(p.markets)
         & df["vol_ratio"].between(p.vol_ratio_min, p.vol_ratio_max)
         & (df["chg_pct"].abs() <= p.price_chg_max)
@@ -228,10 +281,56 @@ def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
         m &= ~df["name"].str.contains("스팩", na=False)
     if p.flow_enabled:
         # 수급 데이터가 없는 종목/패널은 조건을 만족하지 못한 것으로 본다
-        m &= flow_mask(fs, p).fillna(False).astype(bool)
+        m &= flow_mask(df, p).fillna(False).astype(bool)
+    if p.pos_enabled:
+        m &= df["pos_pct"] <= p.pos_max_pct
+    if p.obv_enabled:
+        m &= df["obv_trend"] >= p.obv_min
+    if p.exclude_expiry:
+        ex = np.asarray(expiry, dtype=bool)
+        m &= ~(np.full(len(df), bool(ex)) if ex.ndim == 0 else ex)
+    return m.fillna(False).astype(bool)
 
-    out = df[m.fillna(False)].copy()
-    # 거래량 배수가 클수록, 가격 움직임이 작을수록 높은 점수
-    out["score"] = np.log2(out["vol_ratio"]) * 10 / (1 + out["chg_pct"].abs() + 0.5 * out["max_range"])
+
+def learn_matrix(df: pd.DataFrame, p: ScreenParams) -> pd.DataFrame:
+    """LEARN_FEATURES 값 (결측은 0 또는 중립값)."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        net = sum(pd.to_numeric(df[c], errors="coerce").fillna(0.0) if c in df else 0.0
+                  for c in ("frg_eok", "inst_eok"))
+        flow = net / (df["value_eok"] * max(1, p.flow_days)).replace(0, np.nan)
+        return pd.DataFrame({
+            "log_vol_ratio": np.log(df["vol_ratio"].clip(lower=1e-6)),
+            "abs_chg": df["chg_pct"].abs(),
+            "max_range": df["max_range"],
+            "log_value": np.log(df["value_eok"].clip(lower=1e-6)),
+            "log_mcap": np.log(df["mcap_eok"].clip(lower=1e-6)),
+            "flow_ratio": flow.fillna(0).clip(-1, 1),
+            "pos_pct": df["pos_pct"],
+            "obv_trend": df["obv_trend"],
+            "box_pct": df["box_pct"],
+        }, index=df.index)
+
+
+def score(df: pd.DataFrame, p: ScreenParams) -> pd.Series:
+    if p.score_weights:
+        X = learn_matrix(df, p)
+        s = pd.Series(0.0, index=df.index)
+        for f, (w, mu, sd) in p.score_weights.items():
+            if f in X:
+                s += w * ((X[f] - mu) / (sd or 1)).fillna(0)
+        return s * 100
+    # 기본: 거래량 배수가 클수록, 가격 움직임이 작을수록 높은 점수
+    return np.log2(df["vol_ratio"]) * 10 / (1 + df["chg_pct"].abs() + 0.5 * df["max_range"])
+
+
+def run_screen(panel: Panel, p: ScreenParams) -> pd.DataFrame:
+    """조건에 맞는 종목을 score 내림차순으로 반환."""
+    n = len(panel.dates)
+    if n < p.recent_days + 2:
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+    df = features(panel, p)
+    expiry = p.exclude_expiry and is_option_expiry(panel.dates[-1], panel.dates)
+    out = df[filter_mask(df, p, expiry)].copy()
+    out["score"] = score(out, p)
     out = out.reset_index().sort_values("score", ascending=False)
     return out[RESULT_COLUMNS].reset_index(drop=True)

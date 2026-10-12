@@ -59,6 +59,10 @@ CREATE TABLE IF NOT EXISTS screen_results (
     PRIMARY KEY (run_id, ticker)
 );
 CREATE INDEX IF NOT EXISTS idx_screen_results_ticker ON screen_results(ticker);
+CREATE TABLE IF NOT EXISTS index_ohlcv (
+    date TEXT NOT NULL, code TEXT NOT NULL, close REAL,
+    PRIMARY KEY (date, code)
+);
 """
 
 OHLCV_FIELDS = ["open", "high", "low", "close", "volume", "value"]
@@ -190,7 +194,10 @@ class StockDB:
         main_cols = ["close", "chg_pct", "vol_ratio", "value_eok", "frg_eok", "inst_eok", "score"]
 
         def num(v):
-            return None if pd.isna(v) else float(v)
+            try:
+                return None if pd.isna(v) else float(v)
+            except (TypeError, ValueError):
+                return None
 
         with self._conn() as c:
             c.execute("DELETE FROM screen_runs WHERE asof=? AND params=? AND source=?", (asof, pj, source))
@@ -212,6 +219,60 @@ class StockDB:
              + (" WHERE r.asof=?" if asof else "") + " ORDER BY r.asof DESC, s.run_id DESC, s.rank")
         with self._conn() as c:
             return pd.read_sql_query(q, c, params=[asof] if asof else [])
+
+    # ------------------------------------------------------------ 기간 조회 (백테스트용)
+    def trade_dates(self, start: str | None = None, end: str | None = None) -> list[str]:
+        with self._conn() as c:
+            rows = c.execute("SELECT DISTINCT date FROM ohlcv WHERE date >= ? AND date <= ? ORDER BY date",
+                             (start or "00000000", end or "99999999")).fetchall()
+        return [r[0] for r in rows]
+
+    def load_ohlcv_range(self, start: str, end: str, markets) -> pd.DataFrame:
+        q = (f"SELECT * FROM ohlcv WHERE date >= ? AND date <= ? "
+             f"AND market IN ({','.join('?' * len(markets))})")
+        with self._conn() as c:
+            return pd.read_sql_query(q, c, params=[start, end, *markets])
+
+    def load_flows_range(self, start: str, end: str, investor: str) -> pd.DataFrame:
+        with self._conn() as c:
+            df = pd.read_sql_query(
+                "SELECT date, ticker, net_value FROM flows WHERE investor=? AND date >= ? AND date <= ?",
+                c, params=[investor, start, end])
+        if df.empty:
+            return pd.DataFrame()
+        wide = df.pivot(index="date", columns="ticker", values="net_value")
+        wide.index = pd.to_datetime(wide.index)
+        return wide.sort_index()
+
+    def latest_shares(self) -> pd.Series:
+        """종목별 가장 최근 상장주식수 (과거 시가총액 근사용)."""
+        with self._conn() as c:
+            df = pd.read_sql_query(
+                "SELECT m.ticker, m.shares FROM market_cap m JOIN "
+                "(SELECT ticker, MAX(date) d FROM market_cap GROUP BY ticker) x "
+                "ON m.ticker = x.ticker AND m.date = x.d", c)
+        return df.set_index("ticker")["shares"]
+
+    def ticker_markets(self) -> pd.Series:
+        with self._conn() as c:
+            df = pd.read_sql_query(
+                "SELECT ticker, market FROM ohlcv WHERE date = (SELECT MAX(date) FROM ohlcv) "
+                "UNION SELECT ticker, market FROM tickers WHERE market IS NOT NULL", c)
+        return df.drop_duplicates("ticker").set_index("ticker")["market"]
+
+    def save_index(self, code: str, s: pd.Series):
+        """s: index=YYYYMMDD, 값=종가."""
+        rows = [(d, code, float(v)) for d, v in s.items() if pd.notna(v)]
+        with self._conn() as c:
+            c.executemany("INSERT OR REPLACE INTO index_ohlcv VALUES (?,?,?)", rows)
+
+    def load_index(self, code: str) -> pd.Series:
+        with self._conn() as c:
+            df = pd.read_sql_query("SELECT date, close FROM index_ohlcv WHERE code=? ORDER BY date",
+                                   c, params=[code])
+        s = df.set_index("date")["close"]
+        s.index = pd.to_datetime(s.index)
+        return s
 
     def list_runs(self) -> pd.DataFrame:
         with self._conn() as c:

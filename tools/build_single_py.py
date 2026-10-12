@@ -28,6 +28,8 @@ MODULES = [
     "screener/data/demo.py",
     "screener/data/krx.py",
     "screener/data/dart.py",
+    "screener/backtest.py",
+    "screener/notify.py",
     "screener/gui/theme.py",
     "screener/gui/widgets.py",
     "screener/gui/chart.py",
@@ -36,6 +38,7 @@ MODULES = [
     "screener/gui/account.py",
     "screener/gui/db_dialog.py",
     "screener/gui/performance_view.py",
+    "screener/gui/backtest_view.py",
     "screener/gui/main_window.py",
     "run_screener.py",
 ]
@@ -43,6 +46,7 @@ MODULES = [
 # (모듈, 정규식, 치환) — 모듈이 None 이면 전체 적용
 RULES = [
     (None, r"^from __future__ import annotations\n", ""),
+    (None, r"^[ \t]*from \.+[\w.]* import \([^)]*\)\n", ""),        # 여러 줄 상대 import
     (None, r"^[ \t]*from \.+[\w.]* import [^\n]*\n", ""),          # 상대 import (함수 안 lazy import 포함)
     (None, r"^[ \t]*from screener[\w.]* import [^\n]*\n", ""),
     (None, r"\bT\.([A-Z][A-Z_0-9]*)\b", r"\1"),
@@ -54,6 +58,10 @@ RULES = [
     ("screener/gui/workers.py", r"\bkrx\.login\(", "krx_login("),
     ("screener/gui/workers.py", r"\bkrx\.LEGACY_CACHE_DIR\b", "LEGACY_CACHE_DIR"),
     ("screener/gui/performance_view.py", r"\bperformance\.(\w+)", r"\1"),
+    ("screener/gui/backtest_view.py", r"\bbt\.(\w+)", r"\1"),
+    ("screener/gui/backtest_view.py", r"\bkrx\.(login|backfill)\(", r"krx_\1("),
+    ("screener/data/krx.py", r"\bdef backfill\(", "def krx_backfill("),
+    ("screener/gui/main_window.py", r"from \.\.backtest import current_regime\n", ""),
     ("screener/gui/main_window.py", r"\baccount\.(unlock|AccountDialog)\(", r"\1("),
     # 실행 진입점: 모듈 맨 아래에서 main() 호출은 파일 끝에 한 번만
     ("run_screener.py", r'\nif __name__ == "__main__":\n    main\(\)\n', "\n"),
@@ -105,7 +113,7 @@ def main():
     code = build()
     compile(code, str(OUT), "exec")  # 문법 확인
     leftovers = [ln for ln in code.splitlines()
-                 if re.search(r"^\s*from \.|\bT\.[A-Z]|(?<![\w/.'\"])(demo|krx|account|performance)\.(?!co\b|py\b)[A-Za-z_]", ln)]
+                 if re.search(r"^\s*from \.|\bT\.[A-Z]|(?<![\w/.'\"])(demo|krx|account|performance|bt)\.(?!co\b|py\b)[A-Za-z_]", ln)]
     if leftovers:
         sys.exit("변환되지 않은 참조:\n" + "\n".join(leftovers))
     OUT.write_text(code, encoding="utf-8")

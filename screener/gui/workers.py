@@ -56,3 +56,26 @@ class DartWorker(QThread):
             self.done.emit(self.ticker, self.client.disclosures(self.ticker))
         except Exception as e:  # noqa: BLE001
             self.failed.emit(self.ticker, str(e))
+
+
+class DartBatchWorker(QThread):
+    """여러 종목의 최근 공시 위험/호재 표시를 한 번에 조회."""
+
+    progress = Signal(int, int)
+    done = Signal(object)  # {ticker: flag}
+
+    def __init__(self, client, tickers):
+        super().__init__()
+        self.client, self.tickers = client, list(tickers)
+
+    def run(self):
+        from ..data.dart import summarize_flag
+
+        out = {}
+        for k, t in enumerate(self.tickers, 1):
+            try:
+                out[t] = summarize_flag(self.client.disclosures(t))
+            except Exception as e:  # noqa: BLE001 — 한 종목 실패는 건너뜀
+                print(f"DART {t} 조회 실패: {e}")
+            self.progress.emit(k, len(self.tickers))
+        self.done.emit(out)

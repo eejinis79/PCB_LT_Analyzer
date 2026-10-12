@@ -220,6 +220,27 @@ class AccountDialog(_Base):
         dart.body.addLayout(dart_form)
         self.layout().insertWidget(1, dart)
 
+        tg = Card("텔레그램 알림 (선택)", "자동 실행(daily_run) 결과를 받을 봇. 텔레그램 @BotFather → /newbot 으로 토큰 발급 → "
+                                       "만든 봇에게 아무 말이나 보낸 뒤 '채팅 ID 찾기'.")
+        tg_form = QFormLayout()
+        tg_form.setSpacing(10)
+        self.tg_token = _pw_edit("123456:ABC-...")
+        self.tg_token.setText(creds.telegram_token)
+        self.tg_chat = QLineEdit(creds.telegram_chat)
+        find = QPushButton("채팅 ID 찾기", objectName="Ghost")
+        find.clicked.connect(self._find_chat)
+        test = QPushButton("테스트 전송", objectName="Ghost")
+        test.clicked.connect(self._test_send)
+        tg_form.addRow("봇 토큰", self.tg_token)
+        tg_form.addRow("채팅 ID", self.tg_chat)
+        tg.body.addLayout(tg_form)
+        row = QHBoxLayout()
+        row.addWidget(find)
+        row.addWidget(test)
+        row.addStretch(1)
+        tg.body.addLayout(row)
+        self.layout().insertWidget(2, tg)
+
         self.show_btn = QPushButton("비밀번호 보기", objectName="Ghost", checkable=True)
         self.show_btn.toggled.connect(self._toggle_echo)
         change = QPushButton("계정 비밀번호 변경")
@@ -236,13 +257,37 @@ class AccountDialog(_Base):
 
     def _toggle_echo(self, on: bool):
         mode = QLineEdit.Normal if on else QLineEdit.Password
-        for e in (self.krx_pw, self.dart_pw, self.dart_key):
+        for e in (self.krx_pw, self.dart_pw, self.dart_key, self.tg_token):
             e.setEchoMode(mode)
         self.show_btn.setText("비밀번호 숨기기" if on else "비밀번호 보기")
 
     def creds(self) -> Credentials:
         return Credentials(self.krx_id.text().strip(), self.krx_pw.text(), self.dart_id.text().strip(),
-                           self.dart_pw.text(), self.dart_key.text().strip())
+                           self.dart_pw.text(), self.dart_key.text().strip(),
+                           self.tg_token.text().strip(), self.tg_chat.text().strip())
+
+    def _find_chat(self):
+        from ..notify import NotifyError, find_chat_id
+        try:
+            cid = _busy(find_chat_id, self.tg_token.text().strip())
+        except (NotifyError, Exception) as e:  # noqa: BLE001
+            self.show_error(str(e))
+            return
+        if cid:
+            self.tg_chat.setText(cid)
+            self.show_error("")
+        else:
+            self.show_error("봇에게 먼저 아무 메시지나 보낸 뒤 다시 눌러 주세요.")
+
+    def _test_send(self):
+        from ..notify import send_telegram
+        try:
+            _busy(send_telegram, self.tg_token.text().strip(), self.tg_chat.text().strip(),
+                  "✅ Volume Spike Screener 테스트 메시지")
+        except Exception as e:  # noqa: BLE001
+            self.show_error(str(e))
+            return
+        QMessageBox.information(self, "텔레그램", "전송했습니다. 텔레그램을 확인하세요.")
 
     def _change_password(self):
         dlg = ChangePasswordDialog(self.vault, parent=self)

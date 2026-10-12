@@ -25,11 +25,12 @@ COLUMNS = [
     ("recent_vol", "최근거래량", "{:,.0f}", ""),
     ("base_vol", "평소거래량", "{:,.0f}", ""),
     ("value_eok", "거래대금(억)", "{:,.1f}", "최근 구간 평균 거래대금"),
+    ("disc_flag", "공시", "{}", "최근 90일 DART 공시 중 위험(빨강) · 호재(초록). DART 키가 있으면 자동 조회"),
     ("mcap_eok", "시총(억)", "{:,.0f}", ""),
     ("box_pct", "박스폭%", "{:.1f}", "기준 구간 (최고-최저 종가)/평균"),
     ("score", "점수", "{:.1f}", "log2(거래량배수)×10 / (1 + |기간등락| + 0.5×일중변동)"),
 ]
-NUMERIC = {c for c, *_ in COLUMNS if c not in ("ticker", "name", "market")}
+NUMERIC = {c for c, *_ in COLUMNS if c not in ("ticker", "name", "market", "disc_flag")}
 
 
 class ResultsModel(QAbstractTableModel):
@@ -63,7 +64,7 @@ class ResultsModel(QAbstractTableModel):
         if not index.isValid():
             return None
         col, _, fmt, _ = COLUMNS[index.column()]
-        v = self.df[col].iat[index.row()]
+        v = self.df[col].iat[index.row()] if col in self.df else ""
         if role == Qt.DisplayRole:
             if isinstance(v, float) and math.isnan(v):
                 return "–"
@@ -79,6 +80,8 @@ class ResultsModel(QAbstractTableModel):
                 return QColor(T.WARN if v >= 5 else T.ACCENT)
             if col == "market":
                 return QColor(T.MUTED)
+            if col == "disc_flag" and isinstance(v, str) and v:
+                return QColor(T.UP if v.startswith("위험") else T.GOOD)
             if col == "score":
                 return QColor(T.GOOD)
         if role == Qt.FontRole and col in ("name", "vol_ratio", "score"):
